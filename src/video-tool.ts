@@ -1,0 +1,589 @@
+/**
+ * `workbuddy_draw_video`：把 WorkBuddy 的视频生成能力（国内区与国际区各自的
+ * `text-to-video` / `image-to-video` 模型）暴露成一个 DSH agent 工具。
+ *
+ * 与生图工具（一次同步请求就拿回图片）不同，视频是**异步任务**：
+ * 先 `submitVideo` 拿到 task id，再 `pollVideoTask` 轮询到 completed，
+ * 最后 `downloadVideo` 把每条视频 URL 落成本地 `.mp4`。这一整段都照搬
+ * 官方 CLI 的 `VideoService`（submitTask / pollTask / downloadVideos），
+ * 详见 docs/VIDEO_GEN.md。
+ *
+ * 参数 / 选模型层与生图工具几乎完全一致（共用 MEDIA_TAGS、video 标签常量、
+ * 媒体目录缓存），所以「接受参数」这部分本插件已经就绪；真正多写的是
+ * 上面那段异步执行流程。
+ *
+ * 为什么手写 ToolDefinition（不 import `@deepseek-ai/dsh-tools` 的 `defineTool`）：
+ * 同 image-tool.ts 的注释——宿主 `Tools.register` 只校验 `output.render` 是函数、
+ * `output.schema` 是受支持的 JSON Schema，`schemaOf()` 把 `parameters` 原样投影，
+ * 手写换来零新 peer 依赖、不会触发 tests/host-peers.spec.ts 对可达图的断言。
+ *
+ * @module dsh-connect-workbuddy/video-tool
+ */
+
+import { readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import type { WorkBuddyCredential } from './auth.ts'
+import {
+  MAX_INPUT_IMAGE_BYTES,
+  imageDataUrl,
+  imageMimeForPath,
+  isBareBase64Image,
+  parseImageDataUrl,
+  sniffImageMime,
+} from './image-gen.ts'
+import {
+  DEFAULT_VIDEO_ASPECT_RATIO,
+  DEFAULT_VIDEO_ENABLE_AUDIO,
+  DEFAULT_VIDEO_SECONDS,
+  VIDEO_TAG_IMAGE_TO_VIDEO,
+  VIDEO_TAG_TEXT_TO_VIDEO,
+  WorkBuddyVideoError,
+  parseSupportedSecondsRange,
+  pickVideoModel,
+  resolveVideoParams,
+  type WorkBuddyMediaModel,
+  type WorkBuddyVideoOutcome,
+  type WorkBuddyVideoSubmission,
+} from './video-gen.ts'
+
+/** 工具名。宿主禁止 `run_code`，这个名字与其它 connect 插件的命名习惯一致。 */
+export const WORKBUDDY_VIDEO_TOOL_NAME = 'workbuddy_draw_video'
+
+/** 工具单次执行的上限：提交 + 轮询（最多 ~10 分钟）+ 下载，留足余量。 */
+const VIDEO_TOOL_TIMEOUT_MS = 600_000
+/** 媒体模型目录的缓存时长：目录变化很慢，不必每次都重新读一遍。 */
+export const VIDEO_MODEL_TTL_MS = 5 * 60_000
+/** 下载远程输入图（图生视频时）的上限，不含生视频本身。 */
+const VIDEO_INPUT_TIMEOUT_MS = 30_000
+/** 失败后的冷却：视频按次扣积分且一次要几十秒，连续重试会烧掉大量积分。 */
+const FAILURE_COOLDOWN_MS = 60_000
+
+/** 宿主 ContentBlock 的最小结构（只需要文本块）。 */
+export interface VideoToolContentBlock {
+  readonly type: 'text'
+  readonly text: string
+}
+
+/**
+ * 宿主 `ToolDefinition` 的结构子集。不 import 宿主类型，避免把插件绑死在
+ * 某个宿主版本的类型上。
+ */
+export interface VideoToolDefinition {
+  readonly name: string
+  readonly description: string
+  readonly parameters: Record<string, unknown>
+  readonly output: {
+    readonly schema: Record<string, unknown>
+    render(args: unknown, value: unknown): VideoToolContentBlock[]
+  }
+  readonly timeoutMs: number
+  execute(args: unknown, exec: VideoToolExec): Promise<Record<string, unknown>>
+}
+
+/** 宿主传给 execute 的执行上下文里本工具用得到的部分。 */
+export interface VideoToolExec {
+  readonly signal?: AbortSignal
+}
+
+/** 工具运行所需的外部能力，全部由 `src/index.ts` 注入，便于单测替换。 */
+export interface VideoToolDeps {
+  /** 解析生视频所用区的凭据；该区未登录/未授权则返回 undefined（不要抛异常）。 */
+  readonly resolveCredential: () => Promise<WorkBuddyCredential | undefined>
+  /** 读该凭据所属区的产品配置，返回该区**全部**媒体模型（调用方按 tag 分组）。 */
+  readonly listMediaModels: (
+    credential: WorkBuddyCredential,
+    signal?: AbortSignal,
+  ) => Promise<readonly WorkBuddyMediaModel[]>
+  /** 提交一次生视频任务，拿回 task id。 */
+  readonly submitVideo: (
+    credential: WorkBuddyCredential,
+    request: {
+      readonly model: string
+      readonly prompt: string
+      readonly seconds: number
+      readonly negativePrompt?: string | undefined
+      readonly image?: string | undefined
+      readonly lastImage?: string | undefined
+      readonly resolution?: string | undefined
+      readonly aspectRatio?: string | undefined
+      readonly enableAudio?: boolean | undefined
+    },
+    signal?: AbortSignal,
+  ) => Promise<WorkBuddyVideoSubmission>
+  /** 轮询任务直到完成/失败，返回视频 URL 列表与扣费。 */
+  readonly pollVideoTask: (
+    credential: WorkBuddyCredential,
+    taskId: string,
+    signal?: AbortSignal,
+  ) => Promise<WorkBuddyVideoOutcome>
+  /**
+   * 该区在卡片上钉住的模型 id（按 video tag 分开），没钉就返回 undefined。
+   *
+   * 只在调用方没显式传 `model` 时生效。它与显式参数的区别是「谁写的」：
+   * 显式参数是这次调用者写下的名字，写错就该报错；钉住的是用户上一次在卡片上
+   * 点的，可能随目录变化（换套餐、换区）已经不存在，所以它失效时静默回落到
+   * 组内第一个，而不是让一次生成因为一个过期偏好彻底失败。
+   */
+  readonly preferredVideoModel?: (
+    credential: WorkBuddyCredential,
+    tag: string,
+  ) => string | undefined
+  /** 下载一条视频 URL 到本地，返回绝对路径。 */
+  readonly downloadVideo: (
+    credential: WorkBuddyCredential,
+    url: string,
+    signal?: AbortSignal,
+  ) => Promise<string>
+  readonly logger: { warn(message: string): void }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+/**
+ * 这些失败说明请求真的打到了上游、可能已经扣了积分，才值得进冷却。
+ * 参数写错 / 未登录 / 目录里没有模型都还没花钱，轮询也已先花过提交那次的钱。
+ *
+ * 注意 `REJECTED` **不在**这里：提交阶段被上游 4xx 退回时任务根本没创建、
+ * 积分没花，冷却只会让一次「参数写错了」变成白等一分钟。
+ */
+const BILLABLE_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'AUTH',
+  'RATE_LIMIT',
+  'NO_ROUTE',
+  'UPSTREAM',
+  'EMPTY_RESULT',
+  'TASK_FAILED',
+  'POLL_TIMEOUT',
+])
+
+/**
+ * 是否该进冷却——由「这一次到底有没有把生视频请求发出去」决定。
+ * 读目录 / 选模型 / 参数校验全在「发请求」之前，失败了不花积分、不冷却。
+ * 一旦 `submitVideo` 被调用，提交那次就花钱了，后续轮询 / 下载失败一律进冷却。
+ */
+function isBillableFailure(error: unknown, sent: boolean): boolean {
+  if (!sent) return false
+  if (error instanceof WorkBuddyVideoError) return BILLABLE_FAILURE_CODES.has(error.code)
+  // 请求已发出之后的意外异常（读轮询响应时连接断了等）同样算一次真实尝试。
+  return true
+}
+
+/**
+ * 把任意形态的输入图规整成上游唯一接受的形态：data URL 或 http(s) URL。
+ *
+ * 图生视频的 `image_url` 字段只接受上游可访问的 URL。本地文件路径必须
+ * 读进来、编码成 data URL 再发，否则上游读到的是空响应，返回
+ * "Input ImageUrl data is invalid (too short)"。与 `image-tool.ts` 的
+ * `resolveImageInput` 同一套逻辑：data URL 校验后直传，http(s) 校验可达性
+ * 后直传，裸 base64 / 本地路径 / file:// 读文件编成 data URL。不做缩放
+ * 或格式转换——用户给什么就传什么。
+ */
+async function resolveVideoImageInput(value: string, signal?: AbortSignal): Promise<string> {
+  const text = value.trim()
+
+  // 1. data URL：校验格式与体积后直传
+  if (text.startsWith('data:')) {
+    const parsed = parseImageDataUrl(text)
+    if (parsed === undefined) {
+      throw new WorkBuddyVideoError(
+        'workbuddy video: image 看起来是 data URL，但格式不对（需要 data:image/*;base64,...）。',
+        'INVALID_ARGS',
+      )
+    }
+    const bytes = Buffer.from(parsed.base64, 'base64')
+    assertVideoInputImageBytes(bytes.byteLength, '（内联 data URL）')
+    return text
+  }
+
+  // 2. http(s) URL：只做可达性校验，不下载内容；真正的下载由上游完成
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      const response = await fetch(text, {
+        method: 'HEAD',
+        signal: signal ?? AbortSignal.timeout(VIDEO_INPUT_TIMEOUT_MS),
+      })
+      if (!response.ok) {
+        throw new WorkBuddyVideoError(
+          `workbuddy video: 输入图 URL 不可达（HTTP ${response.status}）: ${text}`,
+          'INVALID_ARGS',
+        )
+      }
+    } catch (error: unknown) {
+      if (error instanceof WorkBuddyVideoError) throw error
+      throw new WorkBuddyVideoError(
+        `workbuddy video: 校验输入图 URL 失败（${text}）：`
+        + (error instanceof Error ? error.message : String(error)),
+        'INVALID_ARGS',
+      )
+    }
+    return text
+  }
+
+  // 3. 裸 base64：编码成 data URL
+  if (isBareBase64Image(text)) {
+    const bytes = Buffer.from(text, 'base64')
+    return encodeVideoInputImage(bytes, '（内联 base64）')
+  }
+
+  // 4. 本地路径 / file:// URL：读文件，编码成 data URL
+  const path = text.startsWith('file:') ? fileURLToPath(text) : text
+  let bytes: Buffer
+  try {
+    bytes = await readFile(path)
+  } catch (error: unknown) {
+    throw new WorkBuddyVideoError(
+      `workbuddy video: 读不到输入图「${path}」：`
+      + (error instanceof Error ? error.message : String(error)),
+      'INVALID_ARGS',
+    )
+  }
+  return encodeVideoInputImage(bytes, path)
+}
+
+/**
+ * 体积与空文件闸门——所有输入图都从这里过，所以「空文件」和「超过 8 MB」
+ * 的文案只有一份。与 `image-tool.ts` 的 `assertInputImageBytes` 同逻辑。
+ *
+ * `byteLength` 必须是解码后的字节数：base64 比原始字节长约 4/3。
+ */
+function assertVideoInputImageBytes(byteLength: number, source: string): void {
+  if (byteLength === 0) {
+    throw new WorkBuddyVideoError(`workbuddy video: 输入图是空文件：${source}`, 'INVALID_ARGS')
+  }
+  if (byteLength > MAX_INPUT_IMAGE_BYTES) {
+    const limit = MAX_INPUT_IMAGE_BYTES / 1024 / 1024
+    const actual = (byteLength / 1024 / 1024).toFixed(1)
+    throw new WorkBuddyVideoError(
+      `workbuddy video: 输入图 ${actual} MB，超过 ${limit} MB 上限：${source}`,
+      'INVALID_ARGS',
+    )
+  }
+}
+
+/** 校验体积、定出 MIME，再把字节编成 data URL。 */
+function encodeVideoInputImage(bytes: Uint8Array, source: string): string {
+  assertVideoInputImageBytes(bytes.byteLength, source)
+  const mime = imageMimeForPath(source) ?? sniffImageMime(bytes)
+  return imageDataUrl(mime, Buffer.from(bytes).toString('base64'))
+}
+
+/**
+ * 造出工具定义。每次 `apply()` 只造一个实例，冷却状态与目录缓存都挂在闭包里，
+ * 生命周期跟着插件走。
+ */
+export function createVideoTool(deps: VideoToolDeps): VideoToolDefinition {
+  let mediaCache: { readonly at: number; readonly models: readonly WorkBuddyMediaModel[] } | undefined
+  let cooldownUntil = 0
+  /**
+   * 上游在拒绝一次提交时顺带告诉我们的「这个模型支持几秒」。
+   *
+   * 目录里没有 `videoGeneration` 的账号（实测国内区部分账号的 `/v3/config`
+   * 条目只有 `{id,name,tags}`）本地无从校验，只能让上游先拒一次。它拒的时候
+   * 会把区间写在文案里，这里记下来：同一个进程里第二次给同样的越界值，就在本地
+   * 被 `resolveVideoParams` 拦下——零请求、零冷却。键带上区域名，因为模型 id
+   * 不跨区（同名 id 在两个区可能是不同模型）。
+   */
+  const learnedSeconds = new Map<string, { readonly minSeconds: number; readonly maxSeconds: number }>()
+  const secondsKey = (domain: string, modelId: string): string => `${domain}|${modelId}`
+
+  const listModels = async (
+    credential: WorkBuddyCredential,
+    signal?: AbortSignal,
+  ): Promise<readonly WorkBuddyMediaModel[]> => {
+    const now = Date.now()
+    if (mediaCache !== undefined && now - mediaCache.at < VIDEO_MODEL_TTL_MS) return mediaCache.models
+    const models = await deps.listMediaModels(credential, signal)
+    mediaCache = { at: now, models }
+    return models
+  }
+
+  return {
+    name: WORKBUDDY_VIDEO_TOOL_NAME,
+    description:
+      '用当前账号的 WorkBuddy 视频生成能力生成一段短视频。'
+      + '不填 image 是文生视频（用该区带 text-to-video 标签的模型）；'
+      + '填了 image 是图生视频（用带 image-to-video 标签的模型）。'
+      + '国内区与国际区都可用，模型取自该区产品配置'
+      + '（国内区 kling-video-v3、minimax-video-h3；国际区 kling-video-v3，'
+      + '两种 video tag 都有；以该区目录为准）。'
+      + '视频是异步任务：先提交、再轮询到完成、最后把视频下载到本地，单次可能要几十秒到几分钟。'
+      + '每次生成会真实消耗 WorkBuddy 积分，单价随区域与模型不同，以返回结果里的 credit 为准；'
+      + '不要在没必要时调用，也不要为了试错连续调用。'
+      + '返回的是本地 .mp4 文件路径（file:// URL），由宿主/客户端打开或下载。',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: '画面描述（中文或英文都可以），≤2500 字符。写清楚主体、动作、风格、镜头。',
+        },
+        image: {
+          type: 'string',
+          description:
+            '输入图，可选。填了就是图生视频（image-to-video）；不填就是文生视频。'
+            + '接受本地绝对路径、file:// URL、http(s) URL、data URL 或裸 base64。'
+            + '上限 8 MB，不做缩放或格式转换。',
+        },
+        model: {
+          type: 'string',
+          description:
+            '模型 id，可选。不填就用用户在设置卡片上按模式钉住的模型；'
+            + '卡片上没钉就用该区目录里第一个带当前模式标签的模型'
+            + '（文生视频看 text-to-video，图生视频看 image-to-video）。'
+            + '填了但该 tag 组里没有会直接报错，不会盲发。',
+        },
+        seconds: {
+          type: 'number',
+          description:
+            '视频时长（秒），可选。不填用模型默认（通常 5s）。'
+            + '该模型在目录里给了 videoGeneration.minSeconds..maxSeconds 时，越界直接报错、不会静默夹取；'
+            + '目录没给区间时交给上游判断，被拒的错误里会带上游支持的范围，改完可立刻重试（不计失败冷却）。',
+        },
+        resolution: {
+          type: 'string',
+          description:
+            '分辨率，可选，如 720P / 1080P（大小写不敏感，按模型目录里的拼写发）。不填用模型默认。'
+            + '该模型在目录里给了 videoGeneration.resolutions 时，不在列内会回落到默认分辨率并给出告警；'
+            + '目录没给这份清单时原样透传，交给上游判断（与 seconds 同一条判据）。',
+        },
+        aspect_ratio: {
+          type: 'string',
+          description:
+            '画面比例，仅文生视频有效，可选：16:9 / 9:16 / 1:1。'
+            + '不填默认 16:9。图生视频由输入图决定比例，传了会被忽略。',
+        },
+        negative_prompt: {
+          type: 'string',
+          description: '不希望出现的元素，可选，≤2500 字符。',
+        },
+        enable_audio: {
+          type: 'boolean',
+          description: '是否生成带声音的视频，可选，默认 true。',
+        },
+      },
+      required: ['prompt'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          videos: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '生成的视频本地路径列表（file:// URL，.mp4）。',
+          },
+          mode: { type: 'string', description: "'text-to-video' 或 'image-to-video'。" },
+          model: { type: 'string', description: '实际使用的模型 id。' },
+          prompt: { type: 'string', description: '实际提交的画面描述。' },
+          seconds: { type: 'number', description: '实际使用的时长（秒）。' },
+          resolution: { type: 'string', description: '实际使用的分辨率。' },
+          hint: { type: 'string', description: '给模型的后续提示（如何打开、扣费）。' },
+          credit: { type: 'number', description: '本次实际消耗的 WorkBuddy 积分。' },
+        },
+        required: ['videos', 'mode', 'model', 'prompt', 'seconds', 'resolution', 'hint'],
+        additionalProperties: false,
+      },
+      render(_args: unknown, value: unknown): VideoToolContentBlock[] {
+        const record = asRecord(value)
+        const videos = Array.isArray(record['videos'])
+          ? (record['videos'] as unknown[]).filter((v): v is string => typeof v === 'string')
+          : []
+        const model = asNonEmptyString(record['model']) ?? 'unknown'
+        const modeLabel = record['mode'] === 'image-to-video' ? '图生视频' : '文生视频'
+        const seconds = typeof record['seconds'] === 'number' ? (record['seconds'] as number) : undefined
+        const resolution = asNonEmptyString(record['resolution'])
+        const credit = typeof record['credit'] === 'number' ? record['credit'] as number : undefined
+        const hint = asNonEmptyString(record['hint']) ?? ''
+        const lines = [
+          `${modeLabel} · 模型：${model}`
+          + (seconds === undefined ? '' : ` · ${seconds}s`)
+          + (resolution === undefined ? '' : ` · ${resolution}`)
+          + (credit === undefined ? '' : ` · 消耗 ${credit} 积分`),
+          '',
+        ]
+        if (videos.length === 0) {
+          lines.push('（没有返回任何视频文件）')
+        } else {
+          videos.forEach((v, i) => {
+            lines.push(`视频 ${i + 1}: [${v}](${v})`)
+          })
+        }
+        if (hint !== '') lines.push('', hint)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: VIDEO_TOOL_TIMEOUT_MS,
+    async execute(args: unknown, exec: VideoToolExec): Promise<Record<string, unknown>> {
+      const record = asRecord(args)
+      const prompt = asNonEmptyString(record['prompt'])
+      if (prompt === undefined) {
+        throw new WorkBuddyVideoError(
+          `${WORKBUDDY_VIDEO_TOOL_NAME}: 参数 prompt 必填，且必须是非空字符串。`,
+          'INVALID_ARGS',
+        )
+      }
+      const requestedModel = asNonEmptyString(record['model'])
+      const requestedSeconds = asNumber(record['seconds'])
+      const requestedResolution = asNonEmptyString(record['resolution'])
+      const requestedAspectRatio = asNonEmptyString(record['aspect_ratio'])
+      const requestedNegativePrompt = asNonEmptyString(record['negative_prompt'])
+      const requestedEnableAudio = asBoolean(record['enable_audio'])
+      // 模式由「有没有给输入图」唯一决定（同生图工具的思路：不增加 mode 参数）。
+      const image = asNonEmptyString(record['image'])
+
+      const now = Date.now()
+      if (now < cooldownUntil) {
+        const seconds = Math.ceil((cooldownUntil - now) / 1000)
+        throw new WorkBuddyVideoError(
+          `workbuddy video: 上一次生视频刚失败过，请 ${seconds} 秒后再试`
+          + '（失败冷却是为了避免连续重试白白烧积分）。',
+          'COOLDOWN',
+        )
+      }
+
+      const credential = await deps.resolveCredential()
+      if (credential === undefined) {
+        throw new WorkBuddyVideoError(
+          'workbuddy video: 没有可用的 WorkBuddy 账号——要么两个区都没登录，'
+          + '要么已登录的那个区没有打开「允许模型自主生图」。'
+          + '请先在插件设置里登录该区账号，并打开那个开关。',
+          'NOT_LOGGED_IN',
+        )
+      }
+
+      const signal = exec.signal === undefined
+        ? AbortSignal.timeout(VIDEO_TOOL_TIMEOUT_MS)
+        : AbortSignal.any([exec.signal, AbortSignal.timeout(VIDEO_TOOL_TIMEOUT_MS)])
+
+      // 这一次到底有没有把生视频请求发出去——冷却的唯一判据。
+      let sent = false
+      // 选中的模型要活到 catch 里：上游拒绝时得知道是哪条模型的区间，好记下来。
+      let chosen: WorkBuddyMediaModel | undefined
+      try {
+        const models = await listModels(credential, signal)
+        // 先把输入图归一成 URL / 本地路径：发生在「发请求」之前，失败不花积分。
+        const imageInput = image === undefined ? undefined : await resolveVideoImageInput(image, signal)
+        const tag = imageInput === undefined ? VIDEO_TAG_TEXT_TO_VIDEO : VIDEO_TAG_IMAGE_TO_VIDEO
+        // 谁写的名字决定写错了谁负责：显式 `model` 是这次调用者写的，不在组里
+        // 就报错；钉住的偏好是用户上次在卡片上点的，目录变了就可能失效，那种
+        // 情况按「没填」处理、回落组内第一个，不拿一个过期偏好卡住整次生成。
+        const pinned = requestedModel === undefined ? deps.preferredVideoModel?.(credential, tag) : undefined
+        let model: WorkBuddyMediaModel
+        try {
+          model = pickVideoModel(models, requestedModel ?? pinned, tag)
+        } catch (error: unknown) {
+          if (requestedModel !== undefined || pinned === undefined) throw error
+          model = pickVideoModel(models, undefined, tag)
+        }
+        chosen = model
+
+        // 校验用的时长区间：以目录给的 `videoGeneration` 为底；上游上一次拒绝时
+        // 自报的区间（learned）存在就覆盖它——那是比目录更晚的事实。
+        const learned = learnedSeconds.get(secondsKey(credential.domain, model.id))
+        const modelConfig = learned === undefined
+          ? model.videoGeneration
+          : { ...model.videoGeneration, ...learned }
+
+        const resolved = resolveVideoParams({
+          model: model.id,
+          prompt,
+          seconds: requestedSeconds,
+          negativePrompt: requestedNegativePrompt,
+          image: imageInput,
+          resolution: requestedResolution,
+          aspectRatio: requestedAspectRatio,
+          enableAudio: requestedEnableAudio,
+        }, modelConfig)
+
+        const request = {
+          model: model.id,
+          prompt,
+          seconds: resolved.seconds,
+          negativePrompt: requestedNegativePrompt,
+          image: imageInput,
+          resolution: resolved.resolution,
+          aspectRatio: resolved.aspectRatio,
+          enableAudio: requestedEnableAudio,
+        }
+        // 真正的请求从这里开始——置位 sent，此后任何失败都算花钱、进冷却。
+        sent = true
+        const submission = await deps.submitVideo(credential, request, signal)
+        const outcome = await deps.pollVideoTask(credential, submission.taskId, signal)
+        const paths: string[] = []
+        for (const url of outcome.videos) {
+          const local = await deps.downloadVideo(credential, url, signal)
+          paths.push(pathToFileURL(local).href)
+        }
+        const mode = imageInput === undefined ? 'text-to-video' : 'image-to-video'
+        const value: Record<string, unknown> = {
+          videos: paths,
+          mode,
+          model: model.id,
+          prompt,
+          seconds: resolved.seconds,
+          resolution: resolved.resolution ?? '',
+          hint:
+            `这段视频来自 WorkBuddy（模型 ${model.id}，${mode === 'image-to-video' ? '图生视频' : '文生视频'}）。`
+            + '按次扣积分，单价随区域与模型不同'
+            + (outcome.credit === undefined
+              ? '（本次响应没带扣费字段，以额度面板为准）。'
+              : `；本次实际扣费 ${outcome.credit} 积分。`)
+            + (resolved.warnings.length > 0 ? ` 提示：${resolved.warnings.join('；')}。` : '')
+            + '视频已下载到本地，请用 file:// 链接打开或下载保存。',
+        }
+        if (outcome.credit !== undefined) value['credit'] = outcome.credit
+        return value
+      } catch (error: unknown) {
+        // 上游把参数退回来时**什么都没创建**：把它自报的支持区间记进本次进程，
+        // 下一次同样的越界值在本地就被拦下，不再多打一次注定失败的请求。
+        if (error instanceof WorkBuddyVideoError && error.code === 'REJECTED' && chosen !== undefined) {
+          const range = parseSupportedSecondsRange(error.message)
+          if (range !== undefined) learnedSeconds.set(secondsKey(credential.domain, chosen.id), range)
+        }
+        if (isBillableFailure(error, sent)) cooldownUntil = Date.now() + FAILURE_COOLDOWN_MS
+        throw error
+      }
+    },
+  }
+}
+
+/** 宿主 tools 服务里本工具用到的那一个方法。 */
+export interface ToolsServiceLike {
+  register(definition: unknown): () => void
+}
+
+/**
+ * 把工具注册进宿主。返回 disposer；调用方负责在插件卸载时调用它。
+ * 注册本身是同步的；`tools` 服务由宿主提供，拿不到就直接返回 undefined 并记警告。
+ */
+export function registerWorkBuddyVideoTool(
+  tools: ToolsServiceLike,
+  deps: VideoToolDeps,
+): (() => void) | undefined {
+  try {
+    return tools.register(createVideoTool(deps))
+  } catch (error: unknown) {
+    deps.logger.warn(
+      `dsh-connect-workbuddy: 注册 ${WORKBUDDY_VIDEO_TOOL_NAME} 失败: `
+      + (error instanceof Error ? error.message : String(error)),
+    )
+    return undefined
+  }
+}
