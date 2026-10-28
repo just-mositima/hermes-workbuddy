@@ -32,6 +32,11 @@
 - README 重写为网关文档；原上游 README 移至 `docs/upstream-README{,.en}.md`
   （两个文档守卫测试同步指向新位置，守卫内容不变）。
 
+### Fixes
+- `tests/diagnose.spec.ts`：读错误消息的断言随 Node ≥ 20 自身把路径写进
+  EISDIR 文案而失配（本机 Node 26 必红）。守卫实质不变（错误 CODE 必须保留、
+  插件不得自附路径），路径断言改为「至多出现一次（Node 自己带的那次）」。
+
 ### Verification
 - typecheck 两个 tsconfig 0 错误；vitest 全量通过（既有1751+ 用例 + 新增
   gateway 用例：固定端口/固定 token 契约、端口占用拒绝启动、JSON 聚合、

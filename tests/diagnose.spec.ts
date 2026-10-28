@@ -144,8 +144,15 @@ describe('WorkBuddyCredentialStore.diagnose', () => {
     await mkdir(join(root, AUTH_DIR, LIVE), { recursive: true })
     const { failures } = await makeStore().diagnose()
     expect(failures[0]?.reason).toBe('unreadable')
-    expect(failures[0]?.message).toContain('EISDIR')
-    expect(failures[0]?.message).not.toContain(LIVE)
+    const message = failures[0]?.message ?? ''
+    expect(message).toContain('EISDIR')
+    // The path check used to be `not.toContain(LIVE)`, written when Node's
+    // EISDIR text carried no path. Node ≥ 20 embeds it itself
+    // (`…, read '<path>'`), and the plugin records the message VERBATIM — so
+    // which of the two forms appears is Node's doing. The substance this
+    // guards survives: the error CODE is kept, and the plugin never APPENDS
+    // a path of its own (at most one occurrence, the one Node supplied).
+    expect(message.split(LIVE).length - 1).toBeLessThanOrEqual(1)
   })
 
   it('keeps absent plugin-owned copies out of the report', async () => {
