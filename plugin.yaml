@@ -1,6 +1,6 @@
 name: workbuddy
 label: WorkBuddy Models
-version: 1.1.0
+version: 1.2.0
 kind: standalone
 description: >
   Turn models from a WorkBuddy desktop sign-in (domestic codebuddy.cn or
@@ -25,9 +25,16 @@ description: >
   paid credit line.
 
   Autostart: the plugin keeps the gateway alive alongside Hermes — it starts it
-  on session start, guarantees it before any workbuddy model call, and a
-  watchdog restarts it after a crash or a container restart. Disable with
+  on session start, guarantees it before any workbuddy model call, a 30s
+  watchdog restarts it after a crash, and the plugin repairs its own
+  `$HERMES_HOME/hooks/workbuddy-autostart` boot hook at load time so a
+  container restart brings the endpoint back with the gateway. Disable with
   `WORKBUDDY_AUTOSTART=0` or `hermes workbuddy autostart off`.
+
+  In-session channel: `/workbuddy` shows the gateway card and runs the account
+  operations (browser sign-in, switch billing account, sign out, refresh model
+  aliases, autostart) through the host's own clarify picker, so updating a
+  sign-in never needs a model turn.
 author: hermes-workbuddy contributors
 license: MIT
 platforms:

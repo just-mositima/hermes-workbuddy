@@ -430,6 +430,23 @@ def lifecycle_hook_installed() -> bool:
     return (target / "HOOK.yaml").is_file() and (target / "handler.py").is_file()
 
 
+def ensure_lifecycle_hook() -> Optional[str]:
+    """Install the boot hook when it is missing — the plugin's self-assembly step.
+
+    Called from ``register``: whichever surface loads the plugin (interactive CLI,
+    TUI, desktop backend, gateway, one-shot run) repairs the hook, so a deployment
+    that only ever installed the plugin still gets the boot-time path. Never
+    overwrites an existing hook (a user may have edited it) and never raises.
+    """
+    try:
+        if lifecycle_hook_installed():
+            return str(_hook_target_dir())
+        return install_lifecycle_hook()
+    except OSError:
+        logger.debug("workbuddy: could not install the gateway boot hook", exc_info=True)
+        return None
+
+
 def install_autostart(ctx: Any) -> None:
     """Wire the plugin into Hermes' lifecycle (called from ``register``).
 
@@ -438,6 +455,7 @@ def install_autostart(ctx: Any) -> None:
     """
     if sys.argv[1:2] == ["workbuddy"]:
         return
+    ensure_lifecycle_hook()
     for hook_name, callback in (
         ("on_session_start", on_session_start),
         ("pre_api_request", on_pre_api_request),
@@ -485,6 +503,205 @@ def _fetch_models(base_url: str, token: str) -> list[str]:
 def _regions_from_state(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     regions = state.get("regions") or {}
     return {name: info for name, info in regions.items() if isinstance(info, dict) and info.get("baseUrl")}
+
+
+def _gateway_capture(*argv: str, timeout: float = 30.0) -> tuple[int, str, str]:
+    """Run one gateway verb and return ``(code, stdout, stderr)``."""
+    try:
+        result = subprocess.run(
+            [_node(), str(_gateway_dir() / "lib" / "bin.js"), *argv],
+            cwd=str(_gateway_dir()),
+            env=_node_env(),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except SystemExit as stop:  # no Node.js on this host
+        return 1, "", f"workbuddy: {stop.code or 'no Node.js found'}"
+    except (OSError, subprocess.SubprocessError) as error:
+        return 1, "", f"workbuddy: could not run the gateway: {error}"
+    return result.returncode, result.stdout or "", result.stderr or ""
+
+
+_ACCOUNT_LINE = re.compile(r"^\s*-\s+(?P<name>.*?)\s+\((?P<id>[^()]+)\)\s*(?P<rest>.*)$")
+
+
+def _list_accounts(region: str) -> list[dict[str, Any]]:
+    """The region's stored accounts, parsed from ``workbuddy account`` (no network)."""
+    if not _is_running():
+        return []
+    code, out, _err = _gateway_capture("account", "--region", region, timeout=15)
+    if code != 0:
+        return []
+    accounts: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        match = _ACCOUNT_LINE.match(line)
+        if not match:
+            continue
+        rest = match.group("rest").strip()
+        accounts.append(
+            {
+                "id": match.group("id").strip(),
+                "name": match.group("name").strip(),
+                "selected": "[selected]" in rest,
+                "enterprise": "[enterprise]" in rest,
+                "summary": rest,
+            }
+        )
+    return accounts
+
+
+def _region_label(region: str) -> str:
+    return "cn (domestic)" if region == "cn" else region
+
+
+def _status_text() -> str:
+    """The card ``/workbuddy`` opens with: gateway, accounts, autostart, per-region counts."""
+    running = _is_running()
+    lines = [
+        "WorkBuddy gateway: "
+        + (f"running (pid {_running_pid()})" if running else "not running")
+        + f" · autostart {'on' if autostart_enabled() else 'off'}"
+        + f" · boot hook {'installed' if lifecycle_hook_installed() else 'missing'}"
+    ]
+    if _stopped_by_operator():
+        lines.append("  parked by `hermes workbuddy stop` — `/workbuddy start` brings it back")
+    token = _read_token()
+    regions = _regions_from_state(_read_state())
+    if not regions:
+        lines.append("  not configured yet — run `hermes workbuddy install`")
+        return "\n".join(lines)
+    for region in sorted(regions):
+        info = regions[region]
+        prefix = ALIAS_PREFIX.get(region, f"wb-{region}")
+        models = len(_fetch_models(info["baseUrl"], token)) if running and token else 0
+        accounts = _list_accounts(region)
+        if accounts:
+            selected = next((a for a in accounts if a["selected"]), None)
+            billing = selected["name"] if selected else "newest sign-in"
+            who = f"{len(accounts)} account(s), billing {billing}"
+        else:
+            who = "no account — `/workbuddy login " + region + "`"
+        lines.append(f"  {region:<6} {info['baseUrl']} · {models} model(s) · {who} · /model {prefix}-<model>")
+    return "\n".join(lines)
+
+
+def _refresh_aliases_text() -> str:
+    token = _read_token()
+    regions = _regions_from_state(_read_state())
+    if not token or not regions:
+        return "WorkBuddy is not set up yet — run `hermes workbuddy install`."
+    models = {region: _fetch_models(info["baseUrl"], token) for region, info in regions.items()}
+    _wire_config(regions, models)
+    total = sum(len(ids) for ids in models.values())
+    return (
+        f"Refreshed {total} model alias(es) from the live catalog — "
+        "`/model wb-…` (domestic) and `/model wbg-…` (global) now resolve."
+    )
+
+
+def _login(region: str) -> str:
+    """Start the browser sign-in detached and hand the user its URL.
+
+    The gateway's ``login`` verb polls the WorkBuddy OAuth endpoint until the
+    browser flow finishes, so it must outlive the slash command: it runs as its
+    own session and writes both the URL file and its output under the state dir.
+    """
+    if not _ensure_running():
+        return f"WorkBuddy gateway could not start; see {_log_path()} (or `hermes workbuddy logs`)."
+    region = "global" if region == "global" else "cn"
+    url_path = _state_dir() / f"login-{region}-url.txt"
+    log_path = _state_dir() / f"login-{region}.log"
+    with contextlib.suppress(OSError):
+        url_path.unlink()
+    try:
+        _state_dir().mkdir(parents=True, exist_ok=True)
+        handle = open(log_path, "ab")  # noqa: SIM115 - the child keeps its own descriptor
+        try:
+            subprocess.Popen(
+                [_node(), str(_gateway_dir() / "lib" / "bin.js"), "login", "--region", region],
+                cwd=str(_gateway_dir()),
+                env=_node_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            handle.close()
+    except OSError as error:
+        return f"Could not start the WorkBuddy sign-in: {error}"
+    url = ""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError):
+            url = url_path.read_text().strip()
+        if url:
+            break
+        time.sleep(0.25)
+    if not url:
+        return f"Sign-in started ({region}) but no URL appeared yet — see {log_path}."
+    return (
+        f"Sign-in started ({region}). Open this URL in a browser and finish the login there:\n\n"
+        f"  {url}\n\n"
+        "The account is stored the moment the browser flow completes — no further step here. "
+        "`/workbuddy account` then lists it, and `/workbuddy aliases` picks up any new models."
+    )
+
+
+def _switch_account(ctx: Any, region: Optional[str] = None) -> str:
+    """Pick which stored account pays, through the host's own clarify picker."""
+    if region not in ("cn", "global"):
+        region = _choose_region(ctx, "Which region's account do you want to change?")
+    accounts = _list_accounts(region)
+    if not accounts:
+        return f"{_region_label(region)}: no stored account yet — `/workbuddy login {region}`."
+    choices = [
+        {
+            "value": account["id"],
+            "label": account["name"] + (" [selected]" if account["selected"] else ""),
+            "description": account["summary"] or account["id"],
+        }
+        for account in accounts
+    ]
+    chosen = ctx.ask_choice(f"Which {_region_label(region)} account should pay for requests?", choices)
+    if not chosen:
+        return _status_text()
+    _code, out, err = _gateway_capture("account", "--region", region, str(chosen), timeout=15)
+    return (out or err).strip() or "workbuddy: account unchanged"
+
+
+def _choose_region(ctx: Any, question: str) -> str:
+    regions = sorted(_regions_from_state(_read_state())) or ["cn"]
+    if len(regions) == 1:
+        return regions[0]
+    picked = ctx.ask_choice(question, [{"value": r, "label": _region_label(r)} for r in regions])
+    return picked if picked in regions else regions[0]
+
+
+def _toggle_autostart(ctx: Any) -> str:
+    chosen = ctx.ask_choice(
+        "Autostart — keep the WorkBuddy gateway running with Hermes?",
+        [
+            {"value": "on", "label": "On", "description": "start on session start / gateway boot; watchdog restarts it"},
+            {"value": "off", "label": "Off", "description": "leave the gateway alone; `stop` also shuts it down"},
+        ],
+    )
+    if chosen == "on":
+        _write_flag(AUTOSTART_MARKER, "on")
+        try:
+            hook = install_lifecycle_hook()
+        except OSError as error:
+            hook = f"could not install ({error})"
+        started = _cmd_start(argparse.Namespace(port=DEFAULT_PORTS["cn"])) == 0
+        return (
+            f"autostart on — gateway {'running' if started else 'could not start'}; boot hook {hook}"
+        )
+    if chosen == "off":
+        _write_flag(AUTOSTART_MARKER, "off")
+        return "autostart off — a running gateway keeps serving; `/workbuddy stop` shuts it down."
+    return _status_text()
 
 
 # ── Config wiring ─────────────────────────────────────────────────────
@@ -584,7 +801,9 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         print(f"workbuddy: gateway hook installed at {install_lifecycle_hook()}")
     except OSError as error:
         print(f"workbuddy: could not install the gateway hook: {error}", file=sys.stderr)
+    _write_flag(AUTOSTART_MARKER, "on")
     print("workbuddy: autostart on — the gateway comes up with Hermes (disable: hermes workbuddy autostart off)")
+    print("workbuddy: in-session channel: /workbuddy (status, sign-in, billing account, aliases)")
     print(f"Gateway log: {_log_path()}")
     return 0
 
@@ -695,8 +914,165 @@ def _cmd_aliases(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_account(args: argparse.Namespace) -> int:
+    argv = ["account", "--region", getattr(args, "region", "cn")]
+    if getattr(args, "clear", False):
+        argv.append("--clear")
+    elif getattr(args, "account", None):
+        argv.append(str(args.account))
+    return _run_gateway(argv).returncode
+
+
+# ── In-session channel: /workbuddy ────────────────────────────────────
+#
+# The operator CLI is one process away from a conversation, which made
+# "change the account" mean "ask the model to shell out". This command is the
+# in-conversation settings surface: `/workbuddy` prints the gateway card and
+# offers the account operations through the host's own clarify picker (the CLI /
+# TUI / desktop panel, or buttons on Telegram/Discord/Slack), so a sign-in or an
+# account switch never needs a model turn — or a separate terminal.
+
+SLASH_MENU: tuple[dict[str, str], ...] = (
+    {"value": "status", "label": "Status", "description": "gateway, accounts, autostart, live model counts"},
+    {"value": "login", "label": "Sign in / add account", "description": "browser sign-in, stored when you finish there"},
+    {"value": "account", "label": "Switch billing account", "description": "choose which stored account pays"},
+    {"value": "aliases", "label": "Refresh models", "description": "re-read the live catalog into Hermes aliases"},
+    {"value": "autostart", "label": "Autostart on/off", "description": "keep the gateway up with Hermes"},
+)
+
+SLASH_USAGE = """WorkBuddy — in-session settings (no model turn needed)
+  /workbuddy                       status card + menu
+  /workbuddy status
+  /workbuddy login [cn|global]     browser sign-in; the account is stored when you finish
+  /workbuddy account [cn|global] [<id>|clear]
+  /workbuddy aliases               re-read the live catalog into Hermes model aliases
+  /workbuddy models [cn|global]
+  /workbuddy credits | checkin
+  /workbuddy autostart [on|off]
+  /workbuddy start | stop | restart | logs
+  /workbuddy logout                delete every stored credential (asks first)"""
+
+
+def _pick_region_arg(tokens: list[str]) -> Optional[str]:
+    for token in tokens:
+        if token.lower() in ("cn", "global"):
+            return token.lower()
+    return None
+
+
+def _slash_menu(ctx: Any) -> str:
+    card = _status_text()
+    action = ctx.ask_choice("WorkBuddy — what do you want to do?", list(SLASH_MENU))
+    if not action:
+        return card
+    if action == "login":
+        return _login(_choose_region(ctx, "Sign in to which region?"))
+    if action == "account":
+        return _switch_account(ctx)
+    if action == "aliases":
+        return _refresh_aliases_text()
+    if action == "autostart":
+        return _toggle_autostart(ctx)
+    return card
+
+
+def build_slash_command(ctx: Any):
+    """``/workbuddy ...`` handler bound to this plugin's context (for ``ask_choice``)."""
+
+    def handler(raw_args: str, **_kwargs: Any) -> str:
+        try:
+            return _slash_invoke(ctx, raw_args)
+        except SystemExit as stop:  # _node()'s "no Node.js" exits must not kill the session
+            return f"workbuddy: {stop.code or 'the gateway could not start'}"
+        except Exception as error:  # a slash command reports, never breaks the session
+            logger.warning("workbuddy: /workbuddy %r failed", raw_args, exc_info=True)
+            return f"workbuddy: {error}"
+
+    return handler
+
+
+def _slash_invoke(ctx: Any, raw_args: str) -> str:
+    """Route one ``/workbuddy`` invocation (``raw_args`` is everything after the name)."""
+
+    tokens = [token for token in (raw_args or "").split() if token]
+    verb = tokens[0].lower().lstrip("/") if tokens else ""
+    rest = tokens[1:]
+    region = _pick_region_arg(rest)
+    if verb in ("", "menu", "settings"):
+        return _slash_menu(ctx)
+    if verb in ("status", "s"):
+        return _status_text()
+    if verb in ("help", "?"):
+        return SLASH_USAGE
+    if verb == "login":
+        return _login(region or _choose_region(ctx, "Sign in to which region?"))
+    if verb in ("account", "accounts"):
+        if "clear" in rest:
+            chosen = _choose_region(ctx, "Clear the billing account for which region?")
+            _code, out, err = _gateway_capture("account", "--region", chosen, "--clear", timeout=15)
+            return (out or err).strip() or "workbuddy: nothing to clear"
+        target = next((t for t in rest if t.lower() not in ("cn", "global")), "")
+        if target and region:
+            _code, out, err = _gateway_capture("account", "--region", region, target, timeout=15)
+            return (out or err).strip() or "workbuddy: account unchanged"
+        return _switch_account(ctx, region)
+    if verb == "aliases":
+        return _refresh_aliases_text()
+    if verb == "models":
+        _code, out, err = _gateway_capture("models", "--region", region or "cn")
+        return (out or err).strip() or "workbuddy: no model list"
+    if verb == "credits":
+        _code, out, err = _gateway_capture("credits", "--region", region or "both", timeout=60)
+        return (out or err).strip() or "workbuddy: no credit report"
+    if verb == "checkin":
+        _code, out, err = _gateway_capture("checkin", "--region", region or "both", timeout=60)
+        return (out or err).strip() or "workbuddy: nothing checked in"
+    if verb == "autostart":
+        mode = next((t.lower() for t in rest if t.lower() in ("on", "off")), "")
+        if mode == "on":
+            _write_flag(AUTOSTART_MARKER, "on")
+            hook = ""
+            try:
+                hook = install_lifecycle_hook()
+            except OSError as error:
+                hook = f"could not install ({error})"
+            _cmd_start(argparse.Namespace(port=DEFAULT_PORTS["cn"]))
+            return f"autostart on — gateway running, boot hook {hook}"
+        if mode == "off":
+            _write_flag(AUTOSTART_MARKER, "off")
+            return "autostart off — a running gateway keeps serving; `/workbuddy stop` shuts it down."
+        return _toggle_autostart(ctx)
+    if verb in ("start", "stop", "restart"):
+        if verb == "start":
+            _cmd_start(argparse.Namespace(port=DEFAULT_PORTS["cn"]))
+        elif verb == "stop":
+            _cmd_stop(argparse.Namespace())
+        else:
+            _cmd_restart(argparse.Namespace(port=DEFAULT_PORTS["cn"]))
+        return _status_text()
+    if verb == "logs":
+        try:
+            lines = _log_path().read_text().splitlines()[-20:]
+        except OSError:
+            return f"No gateway log yet at {_log_path()}."
+        return "\n".join(lines) or "Gateway log is empty."
+    if verb == "logout":
+        confirmed = ctx.ask_choice(
+            "Delete every stored WorkBuddy credential? The desktop app's own sign-in is untouched.",
+            [{"value": "yes", "label": "Yes, sign out"}, {"value": "no", "label": "Cancel"}],
+        )
+        if confirmed != "yes":
+            return _status_text()
+        _code, out, err = _gateway_capture("logout", timeout=30)
+        return (out or err).strip() or "workbuddy: signed out"
+    return f"workbuddy: unknown subcommand {verb!r}\n\n{SLASH_USAGE}"
+
+
+
+
 _COMMANDS = {
     "setup": _cmd_setup,
+    "install": _cmd_setup,
     "login": _cmd_login,
     "start": _cmd_start,
     "stop": _cmd_stop,
@@ -707,6 +1083,7 @@ _COMMANDS = {
     "credits": _cmd_credits,
     "checkin": _cmd_checkin,
     "aliases": _cmd_aliases,
+    "account": _cmd_account,
     "autostart": _cmd_autostart,
 }
 
@@ -714,6 +1091,7 @@ _COMMANDS = {
 def register_cli(subparser: argparse.ArgumentParser) -> None:
     subs = subparser.add_subparsers(dest="workbuddy_action")
     p = subs.add_parser("setup", help="Start the gateway and wire providers + aliases into Hermes")
+    p = subs.add_parser("install", help="One command: setup + autostart wiring (idempotent repair)")
     p.add_argument("--port", default=DEFAULT_PORTS["cn"], help="CN loopback port (global uses port+1)")
     for name, help_text in (
         ("start", "Start the gateway"),
@@ -737,6 +1115,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     ):
         sub = subs.add_parser(name, help=help_text)
         sub.add_argument("--region", choices=("cn", "global", "both"), default="both")
+    account = subs.add_parser("account", help="List, select, or clear a region's billing account")
+    account.add_argument("account", nargs="?", help="Account id or name (omit to list)")
+    account.add_argument("--region", choices=("cn", "global"), default="cn")
+    account.add_argument("--clear", action="store_true", help="Follow the newest sign-in again")
     logs = subs.add_parser("logs", help="Tail the gateway log")
     logs.add_argument("-n", "--lines", type=int, default=40, help="Number of lines (default 40)")
     autostart = subs.add_parser(

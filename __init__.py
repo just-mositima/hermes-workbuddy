@@ -1,19 +1,24 @@
 """WorkBuddy Models plugin.
 
-Registers the operator CLI (`hermes workbuddy ...`): setup, start/stop,
-login, model listing, credit/check-in passthrough. The model traffic itself
-is served by the bundled Node gateway, never by this Python module.
+Registers two surfaces over one bundled Node gateway:
+
+* the operator CLI (`hermes workbuddy ...`): setup/install, start/stop,
+  login, account, model listing, credit/check-in passthrough;
+* the in-session slash command (`/workbuddy`): the same account operations
+  through the host's own clarify picker, so updating a sign-in never needs a
+  model turn.
 
 The plugin also keeps that gateway alive alongside Hermes (session-start and
-pre-request hooks plus a watchdog thread), so a wb-* / wbg-* model never meets
-a dead loopback endpoint after a restart.
+pre-request hooks, a boot hook under ``$HERMES_HOME/hooks`` and a watchdog
+thread), so a wb-* / wbg-* model never meets a dead loopback endpoint after a
+restart — whichever surface started the process.
 """
 
 from __future__ import annotations
 
 import logging
 
-from .cli import install_autostart, register_cli, workbuddy_command
+from .cli import build_slash_command, install_autostart, register_cli, workbuddy_command
 
 logger = logging.getLogger("hermes.plugins.workbuddy")
 
@@ -30,6 +35,18 @@ def register(ctx) -> None:
             "sign-in, start/stop/status, live model and credit listing."
         ),
     )
+    try:
+        ctx.register_command(
+            "workbuddy",
+            build_slash_command(ctx),
+            description=(
+                "WorkBuddy gateway and accounts: status, browser sign-in, billing "
+                "account, model aliases, autostart"
+            ),
+            args_hint="[status|login|account|aliases|models|autostart|logout]",
+        )
+    except Exception:  # an older host without register_command keeps the CLI
+        logger.warning("workbuddy: could not register /workbuddy", exc_info=True)
     try:
         install_autostart(ctx)
     except Exception:  # autostart is a convenience — never break plugin loading
