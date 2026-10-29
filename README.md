@@ -45,6 +45,26 @@ hermes workbuddy start|stop|restart|logs
 
 The gateway runs with `--log-requests` (one JSONL line per upstream attempt in `~/.hermes/workbuddy/requests.<region>.jsonl`) and `--session-title-model hy3`, which re-points Hermes' per-session title requests at a free model — otherwise each conversation shows one extra tiny billed request on the provider's usage page.
 
+## Install note: the security scan
+
+`hermes plugins install` runs a structural scan on community sources and asks for
+confirmation (`caution` verdict) before installing — answer `y`, or pass
+`--force` in scripts. The findings are honest but expected for this package: it
+ships a pre-built Node app, so the scanner sees `inline_shell_exec` strings in
+the bundled gateway (its probe code builds shell commands), the zero-width-space
+channel-rescue feature (`invisible_unicode`), `~/.ssh` path checks in the
+upstream's diagnostics, and loopback-URL literals in the gateway's test
+fixtures. Everything it flags is in the vendored upstream code or its tests —
+the plugin itself (`cli.py`) only runs `node gateway/lib/bin.js` and writes
+Hermes config. Review the findings, not just the count:
+
+```bash
+hermes plugins install just-mositima/hermes-workbuddy --force
+```
+
+A catalog submission (reviewed once, then installable without the prompt) is the
+natural next step if this becomes widely used.
+
 ## Requirements
 
 - Hermes Agent ≥ 0.22
