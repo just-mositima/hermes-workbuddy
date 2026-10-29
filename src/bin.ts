@@ -101,6 +101,8 @@ function printHelp(): void {
     '            --no-pool (disable account-pool rotation/failover)',
     '            --refresh-minutes N (live catalog refresh, default 30)',
     '            --channel-perturbation off|failure|always   --keep-prompt-last',
+    '            --log-requests (JSONL per upstream attempt/usage in the state dir; for request-count audits)',
+    '            --session-title-model ID (bill title-shaped requests at this model; e.g. hy3 = free)',
     '',
     'Account & model management:',
     '  login     sign in through the browser (no desktop app needed) and store the account',
@@ -525,6 +527,10 @@ async function serveCommand(argv: readonly string[]): Promise<number> {
       : Math.round(Number(refreshMinutes) * 60_000),
     channelPerturbation: perturbation,
     keepPromptLast: flags.has('keep-prompt-last'),
+    logRequests: flags.has('log-requests'),
+    ...values.get('session-title-model') === undefined
+      ? {}
+      : { sessionTitleModel: values.get('session-title-model') as string },
   })
   return 0
 }

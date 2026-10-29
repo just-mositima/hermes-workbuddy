@@ -44,13 +44,13 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { WorkBuddyCredentialStore } from './auth.ts'
 import { WorkBuddyCatalog, deriveCatalog } from './catalog.ts'
 import { createWorkBuddyShim, type WorkBuddyShim } from './shim.ts'
-import { WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
+import { WorkBuddyUpstreamClient, modelIdOfBody, type WorkBuddyRegion } from './upstream.ts'
 import { rankPool, type WorkBuddyPoolExclusion, type WorkBuddyPoolMember, type WorkBuddyPoolProbe } from './account-pool.ts'
 import { readPoolProbes, writePoolProbes } from './account-pool-store.ts'
 import { cooldownOf, outcomeOfFailure, redactUpstreamText } from './probe.ts'
@@ -140,6 +140,37 @@ export interface ServeOptions {
   refreshMs: number
   channelPerturbation: 'off' | 'failure' | 'always'
   keepPromptLast: boolean
+  /**
+   * Append one JSONL line per UPSTREAM attempt and per upstream usage report
+   * to `<state>/requests.<region>.jsonl`.
+   *
+   * Exists to answer one question a consumer's own logs cannot: "the provider
+   * billed me N requests for what felt like one conversation — which side
+   * sent the extra ones?" Hermes counts the calls IT makes; the upstream
+   * usage page counts what ARRIVED. Only the gateway sits between the two,
+   * so only the gateway can show whether one inbound request left as one
+   * outbound attempt (host-side duplication) or several (rescue/failover
+   * here). Off by default; when on, a failed attempt is logged too — a
+   * refusal the upstream still bills is exactly the line that explains a
+   * cheap extra charge.
+   */
+  logRequests?: boolean
+  /**
+   * Re-point session-title-shaped requests at this model (upstream's
+   * `sessionTitle` shim option, battle-tested in the DSH plugin: fail-closed
+   * detection of the one-message title prompt, then the body's `model` is
+   * rewritten before it goes upstream).
+   *
+   * Hermes generates one title per session through whichever model the
+   * session runs — measured on the wire here: a ~240-token request whose
+   * prompt embeds the user's opening message, billed at full model rate and
+   * shown on the provider's usage page under the SAME prompt text as the
+   * chat, which reads as a duplicated charge. With this set, that request is
+   * billed at the (free) named model instead. Detection is fail-closed: a
+   * body this build cannot positively identify as a title prompt is never
+   * rewritten, so a mis-titled flag can at worst be a no-op.
+   */
+  sessionTitleModel?: string
 }
 
 interface RegionStack {
@@ -149,6 +180,54 @@ interface RegionStack {
   shim: WorkBuddyShim
   /** Last live roster, for the state file. Empty until the first refresh. */
   modelIds: string[]
+}
+
+/**
+ * Whether one upstream body is a session-TITLE prompt from Hermes.
+ *
+ * Fail-closed by construction: the signature is the exact opening of Hermes'
+ * title template PLUS the two-message shape it always sends (system + the
+ * user's opening message). Anything else — including a future Hermes title
+ * template this build doesn't know — is left untouched, so the worst a wrong
+ * flag can do is be a no-op. The upstream shim has its own detector for the
+ * ORIGINAL host's template; this one exists because that detector is
+ * host-template-specific and no-ops on Hermes' differently-worded prompt
+ * (measured on the wire: the request kept its paid model until this check).
+ */
+function isHermesTitleBody(bodyJson: string): boolean {
+  try {
+    const parsed = JSON.parse(bodyJson) as { messages?: unknown }
+    const messages = parsed.messages
+    if (!Array.isArray(messages) || messages.length !== 2) return false
+    const [system, user] = messages as { role?: unknown, content?: unknown }[]
+    return system?.role === 'system' && typeof system.content === 'string'
+      && system.content.startsWith('You name chat sessions.')
+      && user?.role === 'user'
+  } catch {
+    return false
+  }
+}
+
+/** One body with its `model` replaced (used only for confirmed title prompts). */
+function withModel(bodyJson: string, model: string): string {
+  const parsed = JSON.parse(bodyJson) as Record<string, unknown>
+  parsed['model'] = model
+  return JSON.stringify(parsed)
+}
+
+/**
+ * Append one JSONL diagnostic line for the request log (see
+ * {@link ServeOptions.logRequests}). Fire-and-forget by design; the file is
+ * 0600 like the rest of the state dir and carries only counts and model ids —
+ * never prompt text or tokens.
+ */
+async function appendRequestLog(
+  stateDir: string,
+  region: WorkBuddyRegion,
+  entry: Record<string, unknown>,
+): Promise<void> {
+  const line = JSON.stringify({ ts: new Date().toISOString(), region, ...entry })
+  await appendFile(join(stateDir, `requests.${region}.jsonl`), `${line}\n`, { mode: 0o600 })
 }
 
 function selectionFilePath(stateDir: string, region: WorkBuddyRegion): string {
@@ -323,15 +402,71 @@ export async function runGateway(options: ServeOptions): Promise<void> {
     const selected = await readSelection(stateDir, region)
     if (selected !== undefined) store.selectAccount(selected)
     const catalog = new WorkBuddyCatalog(region)
+    /**
+     * Every upstream attempt gets one JSONL line BEFORE the shim's rescue
+     * ladder sees the result — including refused attempts, which a usage-only
+     * log would miss even though the upstream bills them. Fired without
+     * awaiting: a diagnostic must never delay the request it describes.
+     */
+    let usageInFlight: { modelId?: string } | undefined
+    const loggingClient = options.logRequests === true || options.sessionTitleModel !== undefined
+      ? {
+          chatStream: (credential: Parameters<WorkBuddyUpstreamClient['chatStream']>[0],
+            rawBodyJson: string, signal?: AbortSignal) => {
+            const bodyJson = options.sessionTitleModel !== undefined && isHermesTitleBody(rawBodyJson)
+              ? withModel(rawBodyJson, options.sessionTitleModel)
+              : rawBodyJson
+            const modelId = modelIdOfBody(bodyJson)
+            const startedMs = Date.now()
+            if (options.logRequests === true) {
+              void appendRequestLog(stateDir, region, {
+                kind: 'attempt',
+                model: modelId,
+                ...process.env['WORKBUDDY_LOG_BODIES'] === '1' ? { preview: bodyJson.slice(0, 400) } : {},
+              }).catch(() => {})
+            }
+            usageInFlight = { ...modelId === undefined ? {} : { modelId } }
+            return client.chatStream(credential, bodyJson, signal).then(result => {
+              if (options.logRequests === true) {
+                void appendRequestLog(stateDir, region, {
+                  kind: 'attempt-done',
+                  model: modelId,
+                  ok: result.ok,
+                  ...result.ok ? {} : { status: result.status, upstream: result.kind },
+                  ms: Date.now() - startedMs,
+                }).catch(() => {})
+              }
+              return result
+            })
+          },
+        }
+      : client
     const shim = createWorkBuddyShim({
       store,
-      client,
+      client: loggingClient,
       catalog,
       logger,
       port: options.ports[region],
       token,
       channelPerturbation: options.channelPerturbation,
       keepPromptLast: options.keepPromptLast,
+      ...options.sessionTitleModel === undefined ? {} : {
+        sessionTitle: { enabled: true, model: options.sessionTitleModel },
+      },
+      ...options.logRequests ? {
+        // One 'usage' line per upstream answer that REPORTED token counts.
+        // The attempt lines say what LEFT; this says what the gateway CHARGED
+        // — both sides of any per-conversation request-count discrepancy.
+        onUpstreamUsage: usage => {
+          void appendRequestLog(stateDir, region, {
+            kind: 'usage',
+            ...usageInFlight?.modelId === undefined ? {} : { model: usageInFlight.modelId },
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            cachedTokens: usage.cachedTokens,
+          }).catch(() => {})
+        },
+      } : {},
       ...(options.pool ? {
         // The ranking decides who serves BEFORE the request resolves, and who
         // to TRY after one fails — the same policy the DSH plugin runs, minus

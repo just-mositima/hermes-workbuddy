@@ -91,7 +91,7 @@ workbuddy login     [--region cn|global] [--base URL]   # 浏览器授权登录�
 workbuddy serve     [--region cn|global|both] [--port N | --port-cn/--port-global]
                     [--token STR] [--state-dir DIR] [--no-pool]
                     [--refresh-minutes N] [--channel-perturbation off|failure|always]
-                    [--keep-prompt-last]
+                    [--keep-prompt-last] [--log-requests] [--session-title-model ID]
 workbuddy models    [--region cn|global] [--json] [--enable id1,id2] [--disable id1,id2]
 workbuddy account   [--region cn|global] [list | <id|名称> | --clear]
 workbuddy credits   [--region cn|global|both] [--json]

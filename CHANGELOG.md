@@ -42,6 +42,17 @@
   EISDIR 文案而失配（本机 Node 26 必红）。守卫实质不变（错误 CODE 必须保留、
   插件不得自附路径），路径断言改为「至多出现一次（Node 自己带的那次）」。
 
+### Added（排查支持）
+- `serve --log-requests`：每次上游尝试与每次 usage 上报各写一行 JSONL
+  （`requests.<region>.jsonl`，只含模型 id 与计数，不含提示词正文；临时
+  `WORKBUDDY_LOG_BODIES=1` 可附请求体前缀）。存在的理由：消费者侧日志回答
+  不了「一次会话为什么计费了多条请求」——只有网关站在两侧之间。
+- `serve --session-title-model <id>`：识别 Hermes 的会话标题请求（特征：
+  system 提示以 `You name chat sessions.` 开头 + 恰好两条消息，fail-closed，
+  认不出就不改写）并改写 model 后再发往上游——标题请求改按免费模型计费。
+  上游自带的标题改写只认原宿主（DSH）的模板，对 Hermes 的措辞是 no-op，
+  实测确认后补了这条 Hermes 签名。两层检测可共存。
+
 ### Verification
 - typecheck 两个 tsconfig 0 错误；vitest 全量通过（既有1751+ 用例 + 新增
   gateway 用例：固定端口/固定 token 契约、端口占用拒绝启动、JSON 聚合、
