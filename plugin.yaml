@@ -30,7 +30,7 @@ platforms:
   - macos
   - windows
 requires_hermes: ">=0.22.0"
-repository: https://github.com/OWNER/hermes-workbuddy
+repository: https://github.com/just-mositima/hermes-workbuddy
 provides_tools: []
 provides_hooks: []
 provides_middleware: []

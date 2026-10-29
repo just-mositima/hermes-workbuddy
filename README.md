@@ -3,7 +3,7 @@
 A Hermes Agent plugin that turns models from a **WorkBuddy desktop sign-in** (domestic `codebuddy.cn` / international `workbuddy.ai`) into OpenAI-compatible endpoints Hermes can use as named providers — with browser sign-in, per-model aliases, account failover, credits and daily check-in.
 
 ```bash
-hermes plugins install OWNER/hermes-workbuddy     # install the plugin
+hermes plugins install just-mositima/hermes-workbuddy   # install the plugin
 hermes workbuddy setup                            # start the gateway + write providers/aliases
 hermes workbuddy login --region cn                # authorize in a browser (no desktop app needed)
 hermes workbuddy setup                            # re-run once signed in: aliases from the live catalog
