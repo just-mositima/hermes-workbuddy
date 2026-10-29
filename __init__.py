@@ -3,11 +3,19 @@
 Registers the operator CLI (`hermes workbuddy ...`): setup, start/stop,
 login, model listing, credit/check-in passthrough. The model traffic itself
 is served by the bundled Node gateway, never by this Python module.
+
+The plugin also keeps that gateway alive alongside Hermes (session-start and
+pre-request hooks plus a watchdog thread), so a wb-* / wbg-* model never meets
+a dead loopback endpoint after a restart.
 """
 
 from __future__ import annotations
 
-from .cli import register_cli, workbuddy_command
+import logging
+
+from .cli import install_autostart, register_cli, workbuddy_command
+
+logger = logging.getLogger("hermes.plugins.workbuddy")
 
 
 def register(ctx) -> None:
@@ -22,3 +30,7 @@ def register(ctx) -> None:
             "sign-in, start/stop/status, live model and credit listing."
         ),
     )
+    try:
+        install_autostart(ctx)
+    except Exception:  # autostart is a convenience — never break plugin loading
+        logger.warning("workbuddy: autostart wiring failed", exc_info=True)

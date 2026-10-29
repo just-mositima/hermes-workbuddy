@@ -1693,13 +1693,22 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // force-sets `stream: true` (the upstream only speaks streaming), so the
     // prepared body has already forgotten what the client asked for. Whether
     // to answer JSON is a fact about the INBOUND request.
+    //
+    // ABSENT `stream` now means JSON too — the OpenAI default, and what every
+    // SDK sends when it wants a single completion. The earlier rule (absent ⇒
+    // SSE, kept for the original pi-ai host) broke exactly the callers that
+    // OMIT the field: Hermes' auxiliary paths (vision, titles, compression)
+    // asked for a completion, received `text/event-stream`, and failed with
+    // "invalid response ... chat.completion.chunk" — measured on a real
+    // screenshot analysis. pi-ai always sends `stream: true` explicitly, so
+    // nothing that wants SSE loses it.
     const wantsJson = (() => {
       try {
         const parsed: unknown = JSON.parse(raw)
-        return typeof parsed === 'object' && parsed !== null
-          && (parsed as Record<string, unknown>)['stream'] === false
+        if (typeof parsed !== 'object' || parsed === null) return true
+        return (parsed as Record<string, unknown>)['stream'] !== true
       } catch {
-        return false
+        return true
       }
     })()
     /** Frames to fold, when the answer must come back as one JSON body. */

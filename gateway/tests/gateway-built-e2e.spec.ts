@@ -70,7 +70,13 @@ describe('built gateway (lib/bin.js serve)', () => {
       '--port', String(PORT),
     ], {
       cwd: join(import.meta.dirname, '..'),
-      env: { ...process.env, WORKBUDDY_STATE_DIR: stateDir },
+      env: (() => {
+        const childEnv: NodeJS.ProcessEnv = { ...process.env, WORKBUDDY_STATE_DIR: stateDir }
+        // Prove the state-FILE path: a parent env carrying a token must not
+        // override the file the plugin minted and reports.
+        delete childEnv['WORKBUDDY_GATEWAY_TOKEN']
+        return childEnv
+      })(),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     child.stdout?.on('data', chunk => { childStdout += String(chunk) })

@@ -10373,9 +10373,10 @@ function createWorkBuddyShim(options) {
 		const wantsJson = (() => {
 			try {
 				const parsed = JSON.parse(raw);
-				return typeof parsed === "object" && parsed !== null && parsed["stream"] === false;
+				if (typeof parsed !== "object" || parsed === null) return true;
+				return parsed["stream"] !== true;
 			} catch {
-				return false;
+				return true;
 			}
 		})();
 		/** Frames to fold, when the answer must come back as one JSON body. */

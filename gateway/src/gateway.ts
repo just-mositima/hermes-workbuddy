@@ -297,8 +297,13 @@ export async function writeEnabledModels(
 /** Read-or-mint the gateway bearer. A generated token is 0600 in the state dir. */
 async function resolveGatewayToken(stateDir: string, explicit: string | undefined): Promise<string> {
   if (explicit !== undefined) return explicit
-  const fromEnv = nonBlank(process.env['WORKBUDDY_GATEWAY_TOKEN'])
-  if (fromEnv !== undefined) return fromEnv
+  // The STATE FILE wins over the environment. The plugin mints this file and
+  // reports it as THE token; a launcher that happens to carry
+  // WORKBUDDY_GATEWAY_TOKEN in its environment (the plugin passes Hermes'
+  // whole env, and Hermes loads .env) must not silently give the gateway a
+  // second secret — that mismatch answers every request 401 while everything
+  // still says "ready". The env var remains a fallback for runner setups that
+  // have no state file at all.
   const path = join(stateDir, 'gateway-token')
   try {
     const existing = (await readFile(path, 'utf8')).trim()
@@ -306,6 +311,8 @@ async function resolveGatewayToken(stateDir: string, explicit: string | undefine
   } catch {
     // Mint below.
   }
+  const fromEnv = nonBlank(process.env['WORKBUDDY_GATEWAY_TOKEN'])
+  if (fromEnv !== undefined) return fromEnv
   const minted = randomBytes(32).toString('base64url')
   await writeFile(path, `${minted}\n`, { mode: 0o600 })
   await chmod(path, 0o600)

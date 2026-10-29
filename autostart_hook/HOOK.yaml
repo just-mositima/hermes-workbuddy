@@ -1,0 +1,8 @@
+name: workbuddy-autostart
+description: >-
+  Start the WorkBuddy loopback gateway (the workbuddy plugin's Node sidecar) with
+  the Hermes gateway, so `wb-*` / `wbg-*` models work after a container or
+  process restart without a manual `hermes workbuddy start`.
+events:
+  - gateway:startup
+  - session:start

@@ -1,6 +1,6 @@
 name: workbuddy
 label: WorkBuddy Models
-version: 1.0.0
+version: 1.1.0
 kind: standalone
 description: >
   Turn models from a WorkBuddy desktop sign-in (domestic codebuddy.cn or
@@ -23,6 +23,11 @@ description: >
   no telemetry. Session titles Hermes generates are re-pointed at a free
   model by default (`--session-title-model hy3`), which keeps them off the
   paid credit line.
+
+  Autostart: the plugin keeps the gateway alive alongside Hermes — it starts it
+  on session start, guarantees it before any workbuddy model call, and a
+  watchdog restarts it after a crash or a container restart. Disable with
+  `WORKBUDDY_AUTOSTART=0` or `hermes workbuddy autostart off`.
 author: hermes-workbuddy contributors
 license: MIT
 platforms:
@@ -32,5 +37,8 @@ platforms:
 requires_hermes: ">=0.22.0"
 repository: https://github.com/just-mositima/hermes-workbuddy
 provides_tools: []
-provides_hooks: []
+provides_hooks:
+  - on_session_start
+  - pre_api_request
+  - pre_auxiliary_call
 provides_middleware: []

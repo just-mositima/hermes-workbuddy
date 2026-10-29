@@ -32,7 +32,11 @@ function read(relativePath: string): string {
 
 describe('platform standing', () => {
   it('keeps a Windows runner in the CI matrix', () => {
-    const ci = read('.github/workflows/ci.yml')
+    // Fork note: the workflow moved to the REPOSITORY root when the plugin
+    // became the repo's first layer (`gateway/` is a subdirectory now), so the
+    // guard reads one level up. The substance is unchanged: the matrix must
+    // keep a Windows runner, because losing it fails nothing else.
+    const ci = read('../.github/workflows/ci.yml')
     // A matrix that lost its Windows entry still passes everything else, so
     // this is the only thing that would notice.
     expect(ci).toContain('windows-latest')

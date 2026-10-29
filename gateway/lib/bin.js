@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { B as piAiRuntimeInfo, D as cooldownOf, G as deriveCatalog, H as FALLBACK_WORKBUDDY_MODELS_GLOBAL, I as createWorkBuddyShim, K as fallbackModelsFor, P as redactUpstreamText, Qt as WORKBUDDY_APP_EXECUTABLE_ENV, U as WorkBuddyCatalog, V as FALLBACK_WORKBUDDY_MODELS, X as WORKBUDDY_AUTH_FILE_ENV, Z as WorkBuddyCredentialStore, a as readHostHeartbeat, b as checkinAllAccounts, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, et as defaultDesktopAuthCandidates, f as readPoolProbes, fn as hostPeersInfo, h as oauthStart, in as findWorkbuddyAppExecutableWithSource, k as outcomeOfFailure, m as oauthPoll, mt as WorkBuddyUpstreamClient, o as workbuddyHostHeartbeatPath, ot as legacyWorkbuddyOwnAuthPath, p as writePoolProbes, pn as writeFileAtomic, r as isHeartbeatProcessAlive, tt as defaultDesktopAuthDirs, u as describeRosterSeenPayload, ut as workbuddyOwnAuthPath, v as rankPool, vt as modelIdOfBody } from "./host-heartbeat-wJlDkjCV.js";
+import { B as piAiRuntimeInfo, D as cooldownOf, G as deriveCatalog, H as FALLBACK_WORKBUDDY_MODELS_GLOBAL, I as createWorkBuddyShim, K as fallbackModelsFor, P as redactUpstreamText, Qt as WORKBUDDY_APP_EXECUTABLE_ENV, U as WorkBuddyCatalog, V as FALLBACK_WORKBUDDY_MODELS, X as WORKBUDDY_AUTH_FILE_ENV, Z as WorkBuddyCredentialStore, a as readHostHeartbeat, b as checkinAllAccounts, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, et as defaultDesktopAuthCandidates, f as readPoolProbes, fn as hostPeersInfo, h as oauthStart, in as findWorkbuddyAppExecutableWithSource, k as outcomeOfFailure, m as oauthPoll, mt as WorkBuddyUpstreamClient, o as workbuddyHostHeartbeatPath, ot as legacyWorkbuddyOwnAuthPath, p as writePoolProbes, pn as writeFileAtomic, r as isHeartbeatProcessAlive, tt as defaultDesktopAuthDirs, u as describeRosterSeenPayload, ut as workbuddyOwnAuthPath, v as rankPool, vt as modelIdOfBody } from "./host-heartbeat-7Q5C3Dls.js";
 import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -201,13 +201,13 @@ async function writeEnabledModels(stateDir, region, enabled) {
 /** Read-or-mint the gateway bearer. A generated token is 0600 in the state dir. */
 async function resolveGatewayToken(stateDir, explicit) {
 	if (explicit !== void 0) return explicit;
-	const fromEnv = nonBlank(process.env["WORKBUDDY_GATEWAY_TOKEN"]);
-	if (fromEnv !== void 0) return fromEnv;
 	const path = join(stateDir, "gateway-token");
 	try {
 		const existing = (await readFile(path, "utf8")).trim();
 		if (existing !== "") return existing;
 	} catch {}
+	const fromEnv = nonBlank(process.env["WORKBUDDY_GATEWAY_TOKEN"]);
+	if (fromEnv !== void 0) return fromEnv;
 	const minted = randomBytes(32).toString("base64url");
 	await writeFile(path, `${minted}\n`, { mode: 384 });
 	await chmod(path, 384);

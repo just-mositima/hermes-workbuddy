@@ -152,11 +152,17 @@ describe('non-streaming requests get one JSON completion', () => {
     expect(await response.text()).toContain('data: [DONE]')
   })
 
-  it('keeps an ABSENT stream on SSE too: the default is not flipped', async () => {
+  it('answers an ABSENT stream with JSON — the OpenAI default, and what aux callers send', async () => {
+    // Measured failure this pins: Hermes' auxiliary vision call omits `stream`,
+    // got SSE back, and died with "invalid response ... chat.completion.chunk".
+    // Only an explicit `stream: true` may hold the SSE answer.
     const target = makeShim({ token: 's' })
     await target.ready
     const response = await post(target, BODY)
-    expect(response.headers.get('content-type')).toContain('text/event-stream')
+    expect(response.headers.get('content-type')).toContain('application/json')
+    const body = await response.json() as Record<string, any>
+    expect(body['object']).toBe('chat.completion')
+    expect((body['choices'] as Record<string, any>[])[0]?.['message']?.['content']).toBe('你好，世界')
   })
 })
 

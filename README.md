@@ -29,11 +29,12 @@ The core came from [dingminhua/dsh-connect-workbuddy](https://github.com/dingmin
 ```
 hermes workbuddy setup [--port 8787]   # start gateway + write providers, aliases, .env token
 hermes workbuddy login --region cn|global
-hermes workbuddy status                # gateway state + live model counts
+hermes workbuddy status                # gateway state + autostart + live model counts
 hermes workbuddy models --region cn|global
 hermes workbuddy credits [--region …]  # per-account remaining credit
 hermes workbuddy checkin [--region …]  # claim daily rewards
 hermes workbuddy aliases               # re-write aliases from the live catalog
+hermes workbuddy autostart [on|off]    # keep the gateway alive with Hermes (default: status)
 hermes workbuddy start|stop|restart|logs
 ```
 
@@ -44,6 +45,34 @@ hermes workbuddy start|stop|restart|logs
 - `WORKBUDDY_GATEWAY_TOKEN` in `~/.hermes/.env` when absent
 
 The gateway runs with `--log-requests` (one JSONL line per upstream attempt in `~/.hermes/workbuddy/requests.<region>.jsonl`) and `--session-title-model hy3`, which re-points Hermes' per-session title requests at a free model — otherwise each conversation shows one extra tiny billed request on the provider's usage page.
+
+## Autostart: the gateway lives and dies with Hermes
+
+The gateway is a separate Node process, so a container restart (or a crash) used to leave `wb-*` requests hitting a dead `127.0.0.1:8787`. Two layers now prevent that, both driven by Hermes itself — no compose changes, no extra sidecar:
+
+| Layer | Where | What it does |
+|---|---|---|
+| Plugin hooks | `cli.py`, registered at plugin load | Starts the gateway when a session starts, and again inline before any `workbuddy*` API call — the request waits for a *listening* port, not just a state file. A 30 s watchdog thread restarts it after a crash. |
+| Gateway hook | `$HERMES_HOME/hooks/workbuddy-autostart/` (installed by `setup` / `autostart on`) | Fires on Hermes' `gateway:startup`, so a restarting container has the endpoint up before the first message arrives. |
+
+In the official Hermes container these live under `HERMES_HOME` (`/opt/data`), i.e. on the mounted volume: the plugin, the hook, the sign-in vault and the config all survive `docker stop/up` — one command brings both up:
+
+```bash
+HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+hermes workbuddy status      # gateway: running … + autostart: on + hook: installed
+```
+
+Checks and switches:
+
+```bash
+hermes workbuddy autostart        # on|off, whether the gateway runs, hook installed?
+hermes workbuddy autostart off    # disable (the installed hook then no-ops)
+WORKBUDDY_AUTOSTART=0 hermes …    # disable for one process only
+hermes workbuddy stop             # parks autostart until an explicit `start`
+tail -f $HERMES_HOME/workbuddy/autostart.log   # what the hook dispatched
+```
+
+The gateway hook is read at Hermes startup: after installing it on a machine where Hermes is already running, restart the gateway once (`hermes gateway restart`) for the boot-time path to apply. The plugin hooks need no restart.
 
 ## Install note: the security scan
 
@@ -81,8 +110,10 @@ Both regions run side by side. `wb-*` aliases are domestic, `wbg-*` are internat
 hermes workbuddy stop
 hermes plugins remove workbuddy
 # Optional: delete the gateway's state directory (it lives at
-# $HERMES_HOME/workbuddy) and remove the providers.* / model_aliases.wb* / wbg*
-# entries from config.yaml if you want the aliases gone too.
+# $HERMES_HOME/workbuddy), drop the autostart hook directory
+# ($HERMES_HOME/hooks/workbuddy-autostart — it no-ops without the plugin), and
+# remove the providers.* / model_aliases.wb* / wbg* entries from config.yaml if
+# you want the aliases gone too.
 ```
 
 ## Development
