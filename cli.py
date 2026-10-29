@@ -600,10 +600,11 @@ def _cmd_login(args: argparse.Namespace) -> int:
 
 def _cmd_start(args: argparse.Namespace) -> int:
     port = int(getattr(args, "port", DEFAULT_PORTS["cn"]))
+    _write_flag(STOP_MARKER, None)  # an explicit start overrides a parked `stop`
     if _is_running():
         print(f"workbuddy: gateway already running (pid {_running_pid()})")
         return 0
-    if _ensure_running(quiet=False, port=port):
+    if _ensure_running(quiet=False, port=port, respect_stop=False):
         return 0
     print(f"workbuddy: gateway could not start; see {_log_path()}", file=sys.stderr)
     return 1
