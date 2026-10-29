@@ -1,9 +1,11 @@
 node_modules/
 .pnpm-store/
-lib/
 coverage/
 *.log
 .env
 .DS_Store
 .dsh-vision-router/
 .dsh-npm-cache/
+# NOTE: gateway/lib/ is intentionally NOT ignored — the plugin ships the
+# gateway pre-built so `hermes plugins install` needs no TypeScript toolchain.
+# Rebuild it (cd gateway && npx tsdown) and commit the result with the change.

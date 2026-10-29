@@ -1,0 +1,36 @@
+name: workbuddy
+label: WorkBuddy Models
+version: 1.0.0
+kind: standalone
+description: >
+  Turn models from a WorkBuddy desktop sign-in (domestic codebuddy.cn or
+  international workbuddy.ai) into OpenAI-compatible endpoints Hermes can use
+  as a named provider: `hermes workbuddy setup` starts a loopback gateway and
+  writes the provider entries plus per-model aliases (`wb-*` / `wbg-*`), and
+  `hermes workbuddy login` adds an account by signing in through a browser —
+  no desktop app required on the Hermes machine.
+
+  Disclosure: the gateway is a small Node sidecar (vendor-built, from
+  dingminhua/dsh-connect-workbuddy, MIT) that the plugin starts on 127.0.0.1
+  (ports 8787 CN / 8788 global by default). It reads WorkBuddy sign-ins it was
+  given — browser-OAuth tokens it stored itself in
+  `~/.hermes/workbuddy`, and, when a desktop auth file is present, that file —
+  refreshes them against the WorkBuddy endpoints, and forwards chat
+  completions; credentials never leave the machine except to WorkBuddy's own
+  API. `setup` writes `providers.workbuddy`, `providers.workbuddy-global`,
+  per-model `model_aliases`, and `WORKBUDDY_GATEWAY_TOKEN` in
+  `~/.hermes/.env` (unless already set); it starts no other service and sends
+  no telemetry. Session titles Hermes generates are re-pointed at a free
+  model by default (`--session-title-model hy3`), which keeps them off the
+  paid credit line.
+author: hermes-workbuddy contributors
+license: MIT
+platforms:
+  - linux
+  - macos
+  - windows
+requires_hermes: ">=0.22.0"
+repository: https://github.com/OWNER/hermes-workbuddy
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
