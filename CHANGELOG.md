@@ -8,6 +8,11 @@
 > 变化只在宿主侧（详见 README「与上游的差异」）。
 
 ### Added（网关与 CLI）
+- `workbuddy login`：浏览器授权登录（`oauthStart`/`oauthPoll` 接到 CLI），
+  无需桌面端、无需拷贝凭据文件；token 取自上游 OAuth 服务，写入区域 vault，
+  与桌面端来源的账号共用选择/刷新/账号池。适合桌面端在另一台机器、或
+  桌面端凭据已加密无法在本机读取的场景。登录 URL 同时打印并落盘
+  （`login-<region>-url.txt`，完成即删），防止展示层遮蔽。
 - `workbuddy serve`：常驻回环网关。每区域一个端口（cn 8787 / global 8788），
   bearer 与端口跨重启稳定（`gateway-token` 0600 + `gateway.json` 状态文件）；
   目录定期刷新（默认 30 分钟）；`--no-pool`、`--channel-perturbation`、

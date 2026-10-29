@@ -17,7 +17,7 @@
  */
 
 import { realpathSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -46,16 +46,17 @@ import {
   type GatewayStateDocument,
 } from './gateway.ts'
 import { checkinAllAccounts } from './account-pool-run.ts'
+import { oauthPoll, oauthStart } from './oauth.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, readHostHeartbeat, workbuddyHostHeartbeatPath } from './host-heartbeat.ts'
 import { piAiRuntimeInfo } from './pi-ai-runtime.ts'
 import { hostPeersInfo } from './host-peers.ts'
 import { describeRosterSeenPayload, isKnownRosterSeenVersion, rosterSeenPath } from './roster-seen-store.ts'
 
-type Action = 'doctor' | 'logout' | 'status' | 'serve' | 'models' | 'credits' | 'checkin' | 'account'
+type Action = 'doctor' | 'logout' | 'status' | 'serve' | 'models' | 'credits' | 'checkin' | 'account' | 'login'
 
 /** Actions added for standalone (host-less) use, e.g. behind Hermes. */
-const STANDALONE_ACTIONS: ReadonlySet<string> = new Set(['serve', 'models', 'credits', 'checkin', 'account'])
+const STANDALONE_ACTIONS: ReadonlySet<string> = new Set(['serve', 'models', 'credits', 'checkin', 'account', 'login'])
 
 /**
  * Version of the `doctor --json` document.
@@ -102,6 +103,8 @@ function printHelp(): void {
     '            --channel-perturbation off|failure|always   --keep-prompt-last',
     '',
     'Account & model management:',
+    '  login     sign in through the browser (no desktop app needed) and store the account',
+    '            --region cn|global (default cn)   --base URL (global-region brand base)',
     '  models    list a region\'s models, or edit its enable-list',
     '            --region cn|global (default cn)  --json',
     '            --enable id1,id2   --disable id1,id2   (persisted; gateway picks it up)',
@@ -717,6 +720,78 @@ async function checkinCommand(argv: readonly string[]): Promise<number> {
   return anySuccess ? 0 : 1
 }
 
+/**
+ * `workbuddy login` — add an account by signing in through the browser,
+ * with no desktop app and no credential file to copy.
+ *
+ * The upstream issues a state, the user finishes the sign-in on whatever
+ * device has their browser (the URL carries a code to scan/confirm), and this
+ * command polls for the token, then stores it in the region's vault — the
+ * same vault the desktop-file accounts live in, so selection, refresh, the
+ * pool and every read command treat it identically. This is the path that
+ * works when the desktop app is on ANOTHER machine (its token fields may be
+ * encrypted there and unreadable without the app); tokens obtained this way
+ * are fresh from the OAuth server and stored unencrypted by this tool.
+ */
+async function loginCommand(argv: readonly string[]): Promise<number> {
+  const { values } = parseFlags(argv)
+  const region = parseRegions(values.get('region'), ['cn'] as const)[0] as WorkBuddyRegion
+  const store = makeStore(region)
+  const base = values.get('base')
+  const started = await oauthStart(region, base === undefined ? {} : { base })
+  if ('error' in started) {
+    process.stderr.write(`workbuddy: could not start the sign-in: ${started.error}\n`)
+    return 1
+  }
+  // The URL is BOTH printed and saved: it carries the login state, so a
+  // display layer that masks it must not be able to hide the one thing the
+  // user needs to open.
+  const urlFile = join(resolveStateDir(), `login-${region}-url.txt`)
+  await mkdir(resolveStateDir(), { recursive: true, mode: 0o700 })
+  await writeFile(urlFile, `${started.verificationUri}\n`, { mode: 0o600 })
+  process.stdout.write([
+    `WorkBuddy sign-in (${region}): open this URL in a browser and finish the login there —`,
+    `  ${started.verificationUri}`,
+    `  (also saved to ${urlFile})`,
+    `Waiting up to ${Math.round(started.expiresIn / 60)} minutes; Ctrl+C cancels, nothing is stored until it completes.`,
+    '',
+  ].join('\n'))
+  const deadline = Date.now() + started.expiresIn * 1000
+  for (;;) {
+    const answer = await oauthPoll(started.loginId, region)
+    if (answer.done) {
+      await rm(urlFile, { force: true }).catch(() => {})
+      if ('error' in answer) {
+        process.stderr.write(`workbuddy: sign-in failed: ${answer.error}\n`)
+        return 1
+      }
+      const accountId = await store.addOAuthAccount({
+        accessToken: answer.account.accessToken,
+        refreshToken: answer.account.refreshToken,
+        expiresAtMs: answer.account.expiresAtMs,
+        ...answer.account.refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs: answer.account.refreshExpiresAtMs },
+        domain: answer.account.domain,
+        uid: answer.account.uid,
+        ...answer.account.nickname === undefined ? {} : { nickname: answer.account.nickname },
+        ...answer.account.uin === undefined ? {} : { uin: answer.account.uin },
+        ...answer.account.enterpriseId === undefined ? {} : { enterpriseId: answer.account.enterpriseId },
+      })
+      const saved = (await store.accounts().catch(() => [])).find(account => account.id === accountId)
+      process.stdout.write([
+        `${region}: signed in as ${saved?.accountName === undefined || saved.accountName === '' ? accountId : `${saved.accountName} (${accountId})`}`,
+        `Run \`workbuddy models --region ${region}\` to list the live catalog; a running gateway picks the account up on its next request.`,
+        '',
+      ].join('\n'))
+      return 0
+    }
+    if (Date.now() > deadline) {
+      process.stderr.write('workbuddy: the sign-in window expired; run `workbuddy login` again\n')
+      return 1
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000))
+  }
+}
+
 /** `workbuddy account` — list, select, or clear the billing account. */
 async function accountCommand(argv: readonly string[]): Promise<number> {
   const { flags, positionals, values } = parseFlags(argv)
@@ -804,6 +879,8 @@ export async function run(argv: readonly string[]): Promise<number> {
           return await checkinCommand(flags)
         case 'account':
           return await accountCommand(flags)
+        case 'login':
+          return await loginCommand(flags)
         default:
           return 1
       }

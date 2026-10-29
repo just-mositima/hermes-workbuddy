@@ -33,15 +33,18 @@ npm install -g .
 npm install && npx tsdown && node lib/bin.js --help
 ```
 
-前置条件：本机 WorkBuddy（CodeBuddy）桌面端登录过至少一个账号（国内版或国际版均可）。网关只读桌面端的登录态并按需刷新，不会修改桌面端文件；加密凭据字段需要桌面端程序在场以提供 at-rest key（`WORKBUDDY_APP_EXECUTABLE` 可手动指定）。
+前置条件（二选一）：本机 WorkBuddy（CodeBuddy）桌面端登录过至少一个账号（网关只读其登录态并按需刷新，不改桌面端文件；加密字段需桌面端在场提供 at-rest key，可用 `WORKBUDDY_APP_EXECUTABLE` 指定）；**或** `workbuddy login` 在浏览器里完成一次授权——这条路径不需要桌面端，适合桌面端在另一台机器上的情况，token 直接取自上游 OAuth 服务并存入本工具的 vault。
 
 ## 快速开始（Hermes）
 
 ```bash
-# 1. 启动网关（默认双区域：cn 用 8787，global 用 8788）
+# 1. 登录：在浏览器里完成 WorkBuddy 授权（无需桌面端，无需拷凭据文件）
+workbuddy login --region cn
+
+# 2. 启动网关（默认双区域：cn 用 8787，global 用 8788）
 workbuddy serve
 
-# 2. 另开终端确认模型目录（登录后即为上游实时目录）
+# 3. 另开终端确认模型目录（登录后即为上游实时目录）
 workbuddy models --region cn
 ```
 
@@ -84,6 +87,7 @@ nohup workbuddy serve >/tmp/workbuddy-gateway.log 2>&1 &
 ## CLI 一览
 
 ```
+workbuddy login     [--region cn|global] [--base URL]   # 浏览器授权登录，token 存入本工具 vault
 workbuddy serve     [--region cn|global|both] [--port N | --port-cn/--port-global]
                     [--token STR] [--state-dir DIR] [--no-pool]
                     [--refresh-minutes N] [--channel-perturbation off|failure|always]
