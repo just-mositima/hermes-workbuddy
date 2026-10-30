@@ -30,11 +30,11 @@ The core came from [dingminhua/dsh-connect-workbuddy](https://github.com/dingmin
 hermes workbuddy install [--port 8787] # one command: gateway + providers + aliases + .env + boot hook
 hermes workbuddy setup   [--port 8787] # same wiring (kept for scripts that already call it)
 hermes workbuddy login --region cn|global
-hermes workbuddy account [--region cn|global] [<id>|--clear]
+hermes workbuddy account [--region cn|global] [<index>|<id>|<name>|--clear]
 hermes workbuddy status                # gateway state + autostart + live model counts
 hermes workbuddy models --region cn|global
 hermes workbuddy credits [--region …]  # per-account remaining credit
-hermes workbuddy checkin [--region …]  # claim daily rewards
+hermes workbuddy checkin [--region …] [--auto on|off|status]  # claim daily rewards
 hermes workbuddy aliases               # re-write aliases from the live catalog
 hermes workbuddy autostart [on|off]    # keep the gateway alive with Hermes (default: status)
 hermes workbuddy start|stop|restart|logs
@@ -129,15 +129,30 @@ command instead, dispatched by Hermes itself — no model turn, no tool call:
 ```
 /workbuddy                            status card + menu
 /workbuddy status
+/workbuddy checkin [cn|global]        claim today's reward on every account (一键签到)
+/workbuddy checkin auto [on|off]      let the watchdog claim it once a day, no input
+/workbuddy account [cn|global] [<index>|<id>|<name>|clear]
 /workbuddy login [cn|global]          browser sign-in, URL printed in the conversation
-/workbuddy account [cn|global] [<id>|clear]
 /workbuddy aliases                    re-read the live catalog into Hermes aliases
 /workbuddy models [cn|global]
-/workbuddy credits | checkin
+/workbuddy credits
 /workbuddy autostart [on|off]
 /workbuddy start | stop | restart | logs
 /workbuddy logout                     delete stored credentials (asks first)
 ```
+
+Bare `/workbuddy` opens the menu, whose second item is **Daily check-in (签到)** —
+one pick claims every account's reward. Check-in is idempotent upstream (the
+gateway asks whether today was claimed and only writes when it was not), so
+pressing it twice costs nothing and never double-claims. `checkin auto on` arms
+the same claim once a day from the watchdog thread, logged to
+`$HERMES_HOME/workbuddy/checkin.log`.
+
+Account switching is one picker across both regions: it lists every stored
+account as `CN (domestic) · 176****4084 [selected]` / `Global · just-mositima`,
+plus a *follow the newest sign-in* row per region. For a keyboard-only switch,
+`/workbuddy account 2` takes a 1-based index, an id prefix, or a name fragment.
+Chinese verbs work too (`签到`, `账号`, `登录`, `状态`, `积分`).
 
 The menu is rendered by the host's own clarify picker: the classic CLI / TUI /
 desktop panel locally, buttons on Telegram, Discord and Slack. So the same

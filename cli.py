@@ -41,6 +41,13 @@ AUTOSTART_HOOK_NAME = "workbuddy-autostart"
 STOP_MARKER = "stopped"
 WATCHDOG_SECONDS = 30.0
 WORKBUDDY_PROVIDER_PREFIX = "workbuddy"
+# One-click check-in: `/workbuddy checkin` claims it on demand; the optional
+# daily mode lets the watchdog thread claim it once per day without any input
+# (`hermes workbuddy checkin --auto on`, or `WORKBUDDY_CHECKIN_AUTO=1`).
+CHECKIN_AUTO_MARKER = "checkin-auto"
+CHECKIN_AUTO_ENV = "WORKBUDDY_CHECKIN_AUTO"
+CHECKIN_STAMP = "checkin-stamp"
+CHECKIN_LOG = "checkin.log"
 
 logger = logging.getLogger("hermes.plugins.workbuddy")
 
@@ -400,6 +407,7 @@ def _watchdog_loop() -> None:
                 continue
             if not _is_running():
                 _ensure_running(quiet=True)
+            _auto_checkin_tick()
         except Exception:
             logger.warning("workbuddy watchdog tick failed", exc_info=True)
 
@@ -529,8 +537,6 @@ _ACCOUNT_LINE = re.compile(r"^\s*-\s+(?P<name>.*?)\s+\((?P<id>[^()]+)\)\s*(?P<re
 
 def _list_accounts(region: str) -> list[dict[str, Any]]:
     """The region's stored accounts, parsed from ``workbuddy account`` (no network)."""
-    if not _is_running():
-        return []
     code, out, _err = _gateway_capture("account", "--region", region, timeout=15)
     if code != 0:
         return []
@@ -584,6 +590,13 @@ def _status_text() -> str:
         else:
             who = "no account — `/workbuddy login " + region + "`"
         lines.append(f"  {region:<6} {info['baseUrl']} · {models} model(s) · {who} · /model {prefix}-<model>")
+    stamp = _checkin_stamp()
+    auto = "on" if _checkin_auto_enabled() else "off"
+    lines.append(
+        f"  check-in: auto {auto}"
+        + (f" · last run {stamp}" if stamp else "")
+        + " · `/workbuddy checkin` claims today now"
+    )
     return "\n".join(lines)
 
 
@@ -650,26 +663,232 @@ def _login(region: str) -> str:
     )
 
 
-def _switch_account(ctx: Any, region: Optional[str] = None) -> str:
-    """Pick which stored account pays, through the host's own clarify picker."""
-    if region not in ("cn", "global"):
-        region = _choose_region(ctx, "Which region's account do you want to change?")
-    accounts = _list_accounts(region)
+def _all_accounts() -> list[dict[str, Any]]:
+    """Every stored account across the configured regions, region-tagged."""
+    regions = sorted(_regions_from_state(_read_state())) or sorted(DEFAULT_PORTS)
+    rows: list[dict[str, Any]] = []
+    for region in regions:
+        for account in _list_accounts(region):
+            rows.append({**account, "region": region})
+    return rows
+
+
+def _account_label(account: dict[str, Any]) -> str:
+    flags = " [selected]" if account.get("selected") else ""
+    if account.get("enterprise"):
+        flags += " [enterprise]"
+    return f"{_region_label(account['region'])} · {account['name']}{flags}"
+
+
+def _account_table(accounts: list[dict[str, Any]]) -> str:
+    return "\n".join(f"  {index}. {_account_label(account)}" for index, account in enumerate(accounts, 1))
+
+
+def _match_account(accounts: list[dict[str, Any]], target: str) -> Optional[dict[str, Any]]:
+    """Resolve a typed target: 1-based index, account id (or its prefix), or a name fragment."""
+    token = (target or "").strip()
+    if not token:
+        return None
+    if token.isdigit() and 1 <= int(token) <= len(accounts):
+        return accounts[int(token) - 1]
+    for account in accounts:
+        if account["id"] == token or account["id"].startswith(token):
+            return account
+    lowered = token.casefold()
+    return next((account for account in accounts if lowered in account["name"].casefold()), None)
+
+
+def _apply_account(region: str, account_id: str) -> str:
+    """Persist one region's billing account and say when it takes effect."""
+    code, out, err = _gateway_capture("account", "--region", region, account_id, timeout=15)
+    text = (out or err).strip()
+    if code != 0:
+        return text or f"workbuddy: could not select {account_id} ({region})"
+    return f"{text}\nA running gateway bills the new account from its next request."
+
+
+def _clear_account(region: str) -> str:
+    """Drop the explicit selection so the newest sign-in pays again."""
+    _code, out, err = _gateway_capture("account", "--region", region, "--clear", timeout=15)
+    return (out or err).strip() or f"workbuddy: nothing to clear ({region})"
+
+
+def _switch_account(ctx: Any, region: Optional[str] = None, target: str = "") -> str:
+    """Pick which stored account pays — one picker across CN and global.
+
+    Passing ``region`` narrows the list; passing ``target`` skips the picker
+    entirely (1-based index, account id prefix, or name fragment), which is what
+    makes ``/workbuddy account 2`` a single keystroke switch.
+    """
+    if region in ("cn", "global"):
+        accounts = [{**account, "region": region} for account in _list_accounts(region)]
+    else:
+        accounts = _all_accounts()
     if not accounts:
-        return f"{_region_label(region)}: no stored account yet — `/workbuddy login {region}`."
+        return "No stored account yet — `/workbuddy login` signs one in through the browser."
+    if target:
+        match = _match_account(accounts, target)
+        if match is None:
+            return f"No account matches {target!r}. Stored accounts:\n{_account_table(accounts)}"
+        return _apply_account(match["region"], match["id"])
     choices = [
         {
-            "value": account["id"],
-            "label": account["name"] + (" [selected]" if account["selected"] else ""),
+            "value": f"{account['region']}:{account['id']}",
+            "label": _account_label(account),
             "description": account["summary"] or account["id"],
         }
         for account in accounts
     ]
-    chosen = ctx.ask_choice(f"Which {_region_label(region)} account should pay for requests?", choices)
+    for region_name in sorted({account["region"] for account in accounts if account.get("selected")}):
+        choices.append(
+            {
+                "value": f"clear:{region_name}",
+                "label": f"{_region_label(region_name)} · follow the newest sign-in (clear)",
+                "description": "drop the explicit choice; the next sign-in takes over",
+            }
+        )
+    chosen = ctx.ask_choice("Which account should pay for requests?", choices)
     if not chosen:
         return _status_text()
-    _code, out, err = _gateway_capture("account", "--region", region, str(chosen), timeout=15)
-    return (out or err).strip() or "workbuddy: account unchanged"
+    action, _, value = str(chosen).partition(":")
+    if action == "clear":
+        return _clear_account(value)
+    return _apply_account(action, value)
+
+
+# ── One-click check-in ────────────────────────────────────────────────
+#
+# The gateway's `checkin` verb is already idempotent (it asks upstream whether
+# today was claimed and only writes when it was not), so it is safe to fire from
+# a menu item, a slash verb, or once a day from the watchdog thread.
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _checkin_auto_enabled() -> bool:
+    env = os.environ.get(CHECKIN_AUTO_ENV, "").strip().lower()
+    if env in ("0", "false", "no", "off", "disabled"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return _read_flag(CHECKIN_AUTO_MARKER) == "on"
+
+
+def _checkin_stamp() -> str:
+    return _read_flag(CHECKIN_STAMP) or ""
+
+
+def _checkin_report(region: str = "both") -> tuple[dict[str, list[dict[str, Any]]], int, str]:
+    """Run the gateway's check-in; return ``(rows by region, exit code, raw text)``."""
+    code, out, err = _gateway_capture("checkin", "--region", region, "--json", timeout=180)
+    raw = (out or err).strip()
+    try:
+        report = json.loads(out)
+    except (TypeError, ValueError):
+        return {}, code, raw
+    if not isinstance(report, dict):
+        return {}, code, raw
+    rows = {
+        name: [row for row in value if isinstance(row, dict)]
+        for name, value in report.items()
+        if isinstance(value, list)
+    }
+    return rows, code, raw
+
+
+def _checkin_row_line(region: str, row: dict[str, Any]) -> str:
+    who = row.get("accountName") or row.get("accountId") or "?"
+    status = str(row.get("status") or "")
+    if status == "claimed":
+        detail = ""
+        credit = row.get("credit")
+        if isinstance(credit, (int, float)):
+            detail += f" +{credit:g} credit"
+        streak = row.get("streakDays")
+        if isinstance(streak, (int, float)):
+            detail += f" (streak {int(streak)}d)"
+        return f"  {_region_label(region)} · {who}: claimed{detail}"
+    if status == "already":
+        return f"  {_region_label(region)} · {who}: already claimed today"
+    if status == "skipped":
+        return f"  {_region_label(region)} · {who}: skipped — {row.get('message') or 'no check-in for this account'}"
+    return f"  {_region_label(region)} · {who}: not claimed — {row.get('message') or 'unknown reason'}"
+
+
+def _checkin_card(rows: dict[str, list[dict[str, Any]]], code: int) -> str:
+    """Render an already-claimed report (``region -> rows``) as one card."""
+    lines = [f"WorkBuddy check-in · {_today()}"]
+    gained = 0.0
+    claimed = 0
+    for name in sorted(rows):
+        region_rows = rows[name]
+        if not region_rows:
+            lines.append(f"  {_region_label(name)}: no stored account — `/workbuddy login {name}`")
+            continue
+        for row in region_rows:
+            lines.append(_checkin_row_line(name, row))
+            if row.get("status") == "claimed":
+                claimed += 1
+                credit = row.get("credit")
+                if isinstance(credit, (int, float)):
+                    gained += float(credit)
+    if claimed:
+        lines.append(f"{claimed} account(s) claimed" + (f", +{gained:g} credit today" if gained else ""))
+    else:
+        lines.append("Nothing left to claim today." if code == 0 or rows else "Nothing claimable — see above.")
+    lines.append(
+        "auto: on (claims once a day)" if _checkin_auto_enabled()
+        else "auto: off — `/workbuddy checkin auto on` claims it daily by itself"
+    )
+    return "\n".join(lines)
+
+
+def _checkin_text(region: str = "both") -> str:
+    """Claim today's reward on every account and report it in one card."""
+    rows, code, raw = _checkin_report(region)
+    if not rows:
+        return raw or "workbuddy: no check-in report"
+    return _checkin_card(rows, code)
+
+
+def _checkin_auto_text(mode: str = "status") -> str:
+    """Turn the daily claim on or off (marker file), or report it."""
+    if mode in ("on", "off"):
+        _write_flag(CHECKIN_AUTO_MARKER, mode)
+        if mode == "on":
+            return _checkin_text("both") + "\n\nauto: on — the watchdog thread claims once a day from now on."
+        return "auto: off — `/workbuddy checkin` still claims on demand."
+    auto = _checkin_auto_enabled()
+    stamp = _checkin_stamp()
+    return (
+        f"auto: {'on' if auto else 'off'}"
+        f" · last dated run {stamp or 'never'}"
+        f" · log {_state_dir() / CHECKIN_LOG}"
+    )
+
+
+def _auto_checkin_tick() -> None:
+    """Claim once per day when daily mode is on (called from the watchdog thread)."""
+    if not _checkin_auto_enabled():
+        return
+    today = _today()
+    if _checkin_stamp() == today:
+        return
+    # Stamp first: a failed run must not re-fire on every watchdog tick.
+    _write_flag(CHECKIN_STAMP, today)
+    rows, _code, raw = _checkin_report("both")
+    summary = ", ".join(
+        f"{name}:{row.get('accountName') or row.get('accountId')}={row.get('status')}"
+        for name, region_rows in rows.items()
+        for row in region_rows
+    ) or (raw or "no rows")
+    with contextlib.suppress(OSError):
+        _state_dir().mkdir(parents=True, exist_ok=True)
+        with (_state_dir() / CHECKIN_LOG).open("a", encoding="utf-8") as handle:
+            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {summary}\n")
+
 
 
 def _choose_region(ctx: Any, question: str) -> str:
@@ -877,7 +1096,13 @@ def _cmd_credits(args: argparse.Namespace) -> int:
 
 
 def _cmd_checkin(args: argparse.Namespace) -> int:
-    return _run_gateway(["checkin", "--region", getattr(args, "region", "both")]).returncode
+    mode = getattr(args, "auto", None)
+    if mode:
+        print(_checkin_auto_text(mode))
+        return 0
+    rows, code, raw = _checkin_report(getattr(args, "region", "both"))
+    print(_checkin_text(getattr(args, "region", "both")) if rows else (raw or "workbuddy: nothing checked in"))
+    return 0 if rows else code
 
 
 def _cmd_autostart(args: argparse.Namespace) -> int:
@@ -915,12 +1140,23 @@ def _cmd_aliases(_args: argparse.Namespace) -> int:
 
 
 def _cmd_account(args: argparse.Namespace) -> int:
-    argv = ["account", "--region", getattr(args, "region", "cn")]
+    region = getattr(args, "region", "cn")
     if getattr(args, "clear", False):
-        argv.append("--clear")
-    elif getattr(args, "account", None):
-        argv.append(str(args.account))
-    return _run_gateway(argv).returncode
+        print(_clear_account(region))
+        return 0
+    target = str(getattr(args, "account", "") or "")
+    if target:
+        accounts = [{**account, "region": region} for account in _list_accounts(region)]
+        match = _match_account(accounts, target)
+        if match is None:
+            print(
+                f"workbuddy: no {region} account matches {target!r}\n{_account_table(accounts)}",
+                file=sys.stderr,
+            )
+            return 2
+        print(_apply_account(region, match["id"]))
+        return 0
+    return _run_gateway(["account", "--region", region]).returncode
 
 
 # ── In-session channel: /workbuddy ────────────────────────────────────
@@ -934,8 +1170,9 @@ def _cmd_account(args: argparse.Namespace) -> int:
 
 SLASH_MENU: tuple[dict[str, str], ...] = (
     {"value": "status", "label": "Status", "description": "gateway, accounts, autostart, live model counts"},
-    {"value": "login", "label": "Sign in / add account", "description": "browser sign-in, stored when you finish there"},
-    {"value": "account", "label": "Switch billing account", "description": "choose which stored account pays"},
+    {"value": "checkin", "label": "Daily check-in (签到)", "description": "claim every account's daily reward — one click, safe to repeat"},
+    {"value": "account", "label": "Switch account (切换账号)", "description": "one picker across CN + global; the pick pays for requests"},
+    {"value": "login", "label": "Sign in / add account (登录)", "description": "browser sign-in, stored when you finish there"},
     {"value": "aliases", "label": "Refresh models", "description": "re-read the live catalog into Hermes aliases"},
     {"value": "autostart", "label": "Autostart on/off", "description": "keep the gateway up with Hermes"},
 )
@@ -943,14 +1180,17 @@ SLASH_MENU: tuple[dict[str, str], ...] = (
 SLASH_USAGE = """WorkBuddy — in-session settings (no model turn needed)
   /workbuddy                       status card + menu
   /workbuddy status
+  /workbuddy checkin [cn|global]   claim today's reward on every account (一键签到)
+  /workbuddy checkin auto [on|off] claim once a day by itself
+  /workbuddy account [cn|global] [<index>|<id>|<name>|clear]
   /workbuddy login [cn|global]     browser sign-in; the account is stored when you finish
-  /workbuddy account [cn|global] [<id>|clear]
   /workbuddy aliases               re-read the live catalog into Hermes model aliases
   /workbuddy models [cn|global]
-  /workbuddy credits | checkin
+  /workbuddy credits
   /workbuddy autostart [on|off]
   /workbuddy start | stop | restart | logs
-  /workbuddy logout                delete every stored credential (asks first)"""
+  /workbuddy logout                delete every stored credential (asks first)
+  Chinese verbs work too: 状态 签到 账号 登录 积分"""
 
 
 def _pick_region_arg(tokens: list[str]) -> Optional[str]:
@@ -965,6 +1205,8 @@ def _slash_menu(ctx: Any) -> str:
     action = ctx.ask_choice("WorkBuddy — what do you want to do?", list(SLASH_MENU))
     if not action:
         return card
+    if action == "checkin":
+        return _checkin_text("both")
     if action == "login":
         return _login(_choose_region(ctx, "Sign in to which region?"))
     if action == "account":
@@ -974,6 +1216,7 @@ def _slash_menu(ctx: Any) -> str:
     if action == "autostart":
         return _toggle_autostart(ctx)
     return card
+
 
 
 def build_slash_command(ctx: Any):
@@ -998,35 +1241,34 @@ def _slash_invoke(ctx: Any, raw_args: str) -> str:
     verb = tokens[0].lower().lstrip("/") if tokens else ""
     rest = tokens[1:]
     region = _pick_region_arg(rest)
-    if verb in ("", "menu", "settings"):
+    if verb in ("", "menu", "settings", "菜单", "设置"):
         return _slash_menu(ctx)
-    if verb in ("status", "s"):
+    if verb in ("status", "s", "状态"):
         return _status_text()
-    if verb in ("help", "?"):
+    if verb in ("help", "?", "帮助"):
         return SLASH_USAGE
-    if verb == "login":
+    if verb in ("login", "signin", "登录", "登陆"):
         return _login(region or _choose_region(ctx, "Sign in to which region?"))
-    if verb in ("account", "accounts"):
-        if "clear" in rest:
-            chosen = _choose_region(ctx, "Clear the billing account for which region?")
-            _code, out, err = _gateway_capture("account", "--region", chosen, "--clear", timeout=15)
-            return (out or err).strip() or "workbuddy: nothing to clear"
+    if verb in ("account", "accounts", "账号", "账户", "切换"):
+        if "clear" in rest or "清空" in rest:
+            chosen = region or _choose_region(ctx, "Clear the billing account for which region?")
+            return _clear_account(chosen)
         target = next((t for t in rest if t.lower() not in ("cn", "global")), "")
-        if target and region:
-            _code, out, err = _gateway_capture("account", "--region", region, target, timeout=15)
-            return (out or err).strip() or "workbuddy: account unchanged"
-        return _switch_account(ctx, region)
-    if verb == "aliases":
+        return _switch_account(ctx, region, target)
+    if verb in ("aliases", "刷新"):
         return _refresh_aliases_text()
-    if verb == "models":
+    if verb in ("models", "模型"):
         _code, out, err = _gateway_capture("models", "--region", region or "cn")
         return (out or err).strip() or "workbuddy: no model list"
-    if verb == "credits":
+    if verb in ("credits", "积分", "额度"):
         _code, out, err = _gateway_capture("credits", "--region", region or "both", timeout=60)
         return (out or err).strip() or "workbuddy: no credit report"
-    if verb == "checkin":
-        _code, out, err = _gateway_capture("checkin", "--region", region or "both", timeout=60)
-        return (out or err).strip() or "workbuddy: nothing checked in"
+    if verb in ("checkin", "check-in", "签到", "打卡", "领取"):
+        mode = next((t.lower() for t in rest if t.lower() in ("on", "off")), "")
+        if mode or any(t.lower() in ("auto", "每日", "自动") for t in rest):
+            return _checkin_auto_text(mode or "status")
+        return _checkin_text(region or "both")
+
     if verb == "autostart":
         mode = next((t.lower() for t in rest if t.lower() in ("on", "off")), "")
         if mode == "on":
@@ -1111,10 +1353,16 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         sub.add_argument("--region", choices=("cn", "global"), default="cn")
     for name, help_text in (
         ("credits", "Per-account remaining credit"),
-        ("checkin", "Claim every account's daily reward"),
+        ("checkin", "Claim every account's daily reward (one click)"),
     ):
         sub = subs.add_parser(name, help=help_text)
         sub.add_argument("--region", choices=("cn", "global", "both"), default="both")
+        if name == "checkin":
+            sub.add_argument(
+                "--auto",
+                choices=("on", "off", "status"),
+                help="Claim once a day by itself (on|off) or report that mode",
+            )
     account = subs.add_parser("account", help="List, select, or clear a region's billing account")
     account.add_argument("account", nargs="?", help="Account id or name (omit to list)")
     account.add_argument("--region", choices=("cn", "global"), default="cn")

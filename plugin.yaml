@@ -1,6 +1,6 @@
 name: workbuddy
 label: WorkBuddy Models
-version: 1.2.0
+version: 1.3.0
 kind: standalone
 description: >
   Turn models from a WorkBuddy desktop sign-in (domestic codebuddy.cn or
@@ -34,7 +34,10 @@ description: >
   In-session channel: `/workbuddy` shows the gateway card and runs the account
   operations (browser sign-in, switch billing account, sign out, refresh model
   aliases, autostart) through the host's own clarify picker, so updating a
-  sign-in never needs a model turn.
+  sign-in never needs a model turn. Its second menu item is a one-click daily
+  check-in (`/workbuddy checkin`, also `签到`): it claims every stored account's
+  reward, is idempotent upstream, and can run once a day by itself
+  (`/workbuddy checkin auto on`, logged to `$HERMES_HOME/workbuddy/checkin.log`).
 author: hermes-workbuddy contributors
 license: MIT
 platforms:

@@ -40,10 +40,10 @@ def register(ctx) -> None:
             "workbuddy",
             build_slash_command(ctx),
             description=(
-                "WorkBuddy gateway and accounts: status, browser sign-in, billing "
-                "account, model aliases, autostart"
+                "WorkBuddy gateway and accounts: status, one-click daily check-in, "
+                "browser sign-in, account switch, model aliases, autostart"
             ),
-            args_hint="[status|login|account|aliases|models|autostart|logout]",
+            args_hint="[status|checkin|account|login|aliases|models|credits|autostart|logout]",
         )
     except Exception:  # an older host without register_command keeps the CLI
         logger.warning("workbuddy: could not register /workbuddy", exc_info=True)
