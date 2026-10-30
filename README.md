@@ -3,11 +3,22 @@
 A Hermes Agent plugin that turns models from a **WorkBuddy desktop sign-in** (domestic `codebuddy.cn` / international `workbuddy.ai`) into OpenAI-compatible endpoints Hermes can use as named providers — with browser sign-in, per-model aliases, account failover, credits and daily check-in.
 
 ```bash
-hermes plugins install just-mositima/hermes-workbuddy   # install the plugin
-hermes workbuddy setup                            # start the gateway + write providers/aliases
-hermes workbuddy login --region cn                # authorize in a browser (no desktop app needed)
-hermes workbuddy setup                            # re-run once signed in: aliases from the live catalog
+# 1 · install the plugin — paste this repo URL into the Hermes plugin manager
+#     (desktop app / dashboard), or run it directly:
+hermes plugins install https://github.com/just-mositima/hermes-workbuddy
+# 2 · start the gateway + write provider entries, aliases and the boot hook
+hermes workbuddy install
+# 3 · sign in through a browser (no desktop app needed)
+hermes workbuddy login --region cn
+# 4 · once signed in, refresh the model aliases from the live catalog
+hermes workbuddy setup
 ```
+
+`just-mositima/hermes-workbuddy` (the `owner/repo` shorthand) and the full
+`https://github.com/...` URL are the same install; pick whichever the surface
+you are on accepts. Everything the installer needs is committed — `gateway/lib`
+is pre-built, so `hermes plugins install` runs no `npm`/`pnpm`/`tsc` step and
+the clone itself is the whole download.
 
 Then switch like any model — in a session: `/model wb-hy3`, or from the CLI: `hermes -m wbg-gpt-5.6-luna chat -q "..."`.
 
