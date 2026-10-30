@@ -214,6 +214,8 @@ describe('issue #53: frames are self-contained on the wire', () => {
     const bodyWithTools = JSON.stringify({
       model: 'glm-5.3',
       messages: [{ role: 'user', content: 'hi' }],
+      // SSE frames are the subject here; an absent `stream` now answers JSON.
+      stream: true,
       tools: [{ type: 'function', function: { name: 'bash', parameters: { type: 'object' } } }],
     })
     shim = makeShim(() => ({ ok: true, response: brokenStreamOf(halfFrame('')) }))
