@@ -4,11 +4,13 @@ import {
   POOL_BATCH_GAP_MS,
   probeUpdatesOf,
   testAllAccounts,
+  travelAllAccounts,
 } from '../src/account-pool-run.ts'
 import type {
   WorkBuddyPoolRunnerDeps,
   WorkBuddyPoolTarget,
   WorkBuddyPoolTestRow,
+  WorkBuddyPoolTravelDeps,
 } from '../src/account-pool-run.ts'
 import type { WorkBuddyCredential } from '../src/auth.ts'
 import type { WorkBuddyProbeResult } from '../src/probe.ts'
@@ -314,5 +316,144 @@ describe('probeUpdatesOf', () => {
       row('beta', { modelId: 'm', outcome: 'ok' }),
     ])
     expect(updates['alpha']?.atMs).toBe(updates['beta']?.atMs)
+  })
+})
+
+describe('travelAllAccounts', () => {
+  type TravelDeps = WorkBuddyPoolTravelDeps
+
+  function travelDeps(overrides: Partial<TravelDeps> = {}): TravelDeps & { calls: string[] } {
+    // Every call is recorded here, not in the default bodies: a test that
+    // replaces one step must still be able to assert the ORDER of the others.
+    const calls: string[] = []
+    const base = credentialsFor(['a', 'b'])
+    return {
+      calls,
+      credentialFor: overrides.credentialFor ?? base,
+      fetchTravelStatus: async (credential) => {
+        calls.push('status')
+        return overrides.fetchTravelStatus === undefined
+          ? { state: 'idle', dailyLimitReached: false }
+          : overrides.fetchTravelStatus(credential)
+      },
+      claimTravelReward: async (credential) => {
+        calls.push('claim')
+        return overrides.claimTravelReward === undefined
+          ? { credit: 8 }
+          : overrides.claimTravelReward(credential)
+      },
+      departBuddy: async (credential, locationId) => {
+        calls.push(`depart:${locationId ?? 'random'}`)
+        return overrides.departBuddy === undefined
+          ? { location: '咖啡馆' }
+          : overrides.departBuddy(credential, locationId)
+      },
+      wait: async () => undefined,
+    }
+  }
+
+  const TWO: readonly WorkBuddyPoolTarget[] = [
+    { accountId: 'a', accountName: 'Alpha' },
+    { accountId: 'b', accountName: 'Beta' },
+  ]
+
+  it('claims a landed reward BEFORE dispatching, and reports both', async () => {
+    // The ordering is the feature: `arrived` blocks a dispatch, so a run that
+    // dispatched first would silently skip the reward every time.
+    let statusCalls = 0
+    const deps = travelDeps({
+      fetchTravelStatus: async () => {
+        statusCalls += 1
+        return { state: statusCalls === 1 ? 'arrived' : 'idle', dailyLimitReached: false }
+      },
+    })
+    const rows = await travelAllAccounts(TWO.slice(0, 1), deps)
+
+    expect(deps.calls).toEqual(['status', 'claim', 'status', 'depart:random'])
+    expect(rows[0]).toMatchObject({ status: 'claimed', credit: 8, departed: true, location: '咖啡馆' })
+  })
+
+  it('leaves a trip in flight alone', async () => {
+    const deps = travelDeps({
+      fetchTravelStatus: async () => ({ state: 'traveling', dailyLimitReached: false, arriveAtMs: 1_700_000_000_000 }),
+    })
+    const rows = await travelAllAccounts(TWO.slice(0, 1), deps)
+    expect(rows[0]).toMatchObject({ status: 'traveling', arriveAtMs: 1_700_000_000_000 })
+    expect(deps.calls).toEqual(['status'])
+  })
+
+  it("never dispatches once the server's daily cap is reached", async () => {
+    const deps = travelDeps({
+      fetchTravelStatus: async () => ({ state: 'idle', dailyLimitReached: true }),
+    })
+    const rows = await travelAllAccounts(TWO.slice(0, 1), deps)
+    expect(rows[0]?.status).toBe('limit')
+    expect(deps.calls).toEqual(['status'])
+  })
+
+  it('claims nothing on a read-only run', async () => {
+    const deps = travelDeps({
+      fetchTravelStatus: async () => ({ state: 'arrived', dailyLimitReached: false, rewardCredit: 8 }),
+    })
+    const rows = await travelAllAccounts(TWO.slice(0, 1), deps, { readOnly: true })
+    expect(rows[0]).toMatchObject({ status: 'arrived', credit: 8 })
+    expect(deps.calls).toEqual(['status'])
+  })
+
+  it('reports an account without 派猫猫 as skipped, not failed', async () => {
+    // `403 no active buddy` is account state; painting it red every run would
+    // send the user off to fix their credentials.
+    const deps = travelDeps({
+      fetchTravelStatus: async () => ({ state: 'arrived', dailyLimitReached: false }),
+      claimTravelReward: async () => {
+        throw new Error('workbuddy travel: no active buddy')
+      },
+    })
+    const rows = await travelAllAccounts(TWO.slice(0, 1), deps)
+    expect(rows[0]?.status).toBe('skipped')
+    expect(rows[0]?.message).toContain('no active buddy')
+  })
+
+  it('keeps the claim when only the dispatch fails', async () => {
+    // The claim already happened upstream; hiding it would hide a real gain.
+    let statusCalls = 0
+    const deps = travelDeps({
+      fetchTravelStatus: async () => {
+        statusCalls += 1
+        return { state: statusCalls === 1 ? 'arrived' : 'idle', dailyLimitReached: false }
+      },
+      departBuddy: async () => {
+        throw new Error('workbuddy upstream limit (http 429): too many requests')
+      },
+    })
+    const rows = await travelAllAccounts(TWO.slice(0, 1), deps)
+    expect(rows[0]).toMatchObject({ status: 'claimed', credit: 8 })
+    expect(rows[0]?.message).toContain('dispatch failed')
+  })
+
+  it('turns one account failure into a row and keeps going', async () => {
+    const deps = travelDeps({
+      fetchTravelStatus: async (credential) => {
+        if (credential.uin === 'a') throw new Error('boom')
+        return { state: 'idle', dailyLimitReached: false }
+      },
+    })
+    const rows = await travelAllAccounts(TWO, deps)
+    expect(rows.map(row => row.status)).toEqual(['failed', 'departed'])
+  })
+
+  it('picks a destination client-side, because the upstream rejects an empty body', async () => {
+    const seen: (number | undefined)[] = []
+    const deps = travelDeps({
+      departBuddy: async (_credential, locationId) => {
+        seen.push(locationId)
+        return {}
+      },
+    })
+    await travelAllAccounts(TWO.slice(0, 1), deps)
+    await travelAllAccounts(TWO.slice(0, 1), deps, { locationId: 3 })
+    // undefined means "the upstream chooses"; the real command fills 1-4 before
+    // the call, and an explicit --location must pass straight through.
+    expect(seen).toEqual([undefined, 3])
   })
 })

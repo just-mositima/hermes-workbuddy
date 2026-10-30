@@ -48,8 +48,19 @@ CHECKIN_AUTO_MARKER = "checkin-auto"
 CHECKIN_AUTO_ENV = "WORKBUDDY_CHECKIN_AUTO"
 CHECKIN_STAMP = "checkin-stamp"
 CHECKIN_LOG = "checkin.log"
+# Buddy travel (派猫猫): the closed loop claims a landed reward, then dispatches.
+# On demand via `travel`, and once a day from the watchdog when armed.
+TRAVEL_AUTO_MARKER = "travel-auto"
+TRAVEL_AUTO_ENV = "WORKBUDDY_TRAVEL_AUTO"
+TRAVEL_STAMP = "travel-stamp"
+TRAVEL_LOG = "travel.log"
 
 logger = logging.getLogger("hermes.plugins.workbuddy")
+
+try:  # the plugin package's own modules; plain imports keep `import cli` working
+    from . import notify as _notify
+except ImportError:  # pragma: no cover - checkout/test import
+    import notify as _notify  # type: ignore[no-redef]
 
 
 # ── Paths & environment ────────────────────────────────────────────────
@@ -408,6 +419,7 @@ def _watchdog_loop() -> None:
             if not _is_running():
                 _ensure_running(quiet=True)
             _auto_checkin_tick()
+            _auto_travel_tick()
         except Exception:
             logger.warning("workbuddy watchdog tick failed", exc_info=True)
 
@@ -596,6 +608,11 @@ def _status_text() -> str:
         f"  check-in: auto {auto}"
         + (f" · last run {stamp}" if stamp else "")
         + " · `/workbuddy checkin` claims today now"
+    )
+    lines.append(
+        f"  travel:   auto {'on' if _travel_auto_enabled() else 'off'}"
+        + (f" · last run {_travel_stamp()}" if _travel_stamp() else "")
+        + " · `/workbuddy travel` claims + dispatches the 派猫猫 buddy"
     )
     return "\n".join(lines)
 
@@ -853,6 +870,29 @@ def _checkin_text(region: str = "both") -> str:
     return _checkin_card(rows, code)
 
 
+def _run_checkin(
+    region: str = "both",
+    *,
+    travel: bool = False,
+    location: Optional[int] = None,
+    announce: bool = True,
+) -> str:
+    """Check in, optionally run the travel loop, and push the result if configured."""
+    rows, code, raw = _checkin_report(region)
+    if not rows:
+        return raw or "workbuddy: no check-in report"
+    text = _checkin_card(rows, code)
+    ok = not any(row.get("status") == "failed" for region_rows in rows.values() for row in region_rows)
+    if announce:
+        note = _notify_after("WorkBuddy 签到", text, ok=ok)
+        if note:
+            text += "\n" + note
+    if travel:
+        travel_text, _ok = _run_travel(region, location=location, announce=announce)
+        text += "\n\n" + travel_text
+    return text
+
+
 def _checkin_auto_text(mode: str = "status") -> str:
     """Turn the daily claim on or off (marker file), or report it."""
     if mode in ("on", "off"):
@@ -888,6 +928,164 @@ def _auto_checkin_tick() -> None:
         _state_dir().mkdir(parents=True, exist_ok=True)
         with (_state_dir() / CHECKIN_LOG).open("a", encoding="utf-8") as handle:
             handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {summary}\n")
+
+
+# ── Buddy travel (派猫猫) ─────────────────────────────────────────────
+#
+# Same shape as check-in — one row per account per region — but the loop is a
+# closed one: claim a landed reward FIRST, then dispatch. Both happen inside the
+# gateway (it owns the credentials and the refresh), so this layer only renders
+# and schedules.
+
+
+def _travel_auto_enabled() -> bool:
+    env = os.environ.get(TRAVEL_AUTO_ENV, "").strip().lower()
+    if env in ("0", "false", "no", "off", "disabled"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return _read_flag(TRAVEL_AUTO_MARKER) == "on"
+
+
+def _travel_stamp() -> str:
+    return _read_flag(TRAVEL_STAMP) or ""
+
+
+def _travel_report(
+    region: str = "both", *, status_only: bool = False, location: Optional[int] = None
+) -> tuple[dict[str, list[dict[str, Any]]], int, str]:
+    """Run the gateway's travel loop; return ``(rows by region, exit code, raw text)``."""
+    argv = ["travel", "--region", region, "--json"]
+    if status_only:
+        argv.append("--status")
+    if location is not None:
+        argv.extend(["--location", str(int(location))])
+    code, out, err = _gateway_capture(*argv, timeout=240)
+    raw = (out or err).strip()
+    try:
+        report = json.loads(out)
+    except (TypeError, ValueError):
+        return {}, code, raw
+    if not isinstance(report, dict):
+        return {}, code, raw
+    rows = {
+        name: [row for row in value if isinstance(row, dict)]
+        for name, value in report.items()
+        if isinstance(value, list)
+    }
+    return rows, code, raw
+
+
+def _travel_row_line(region: str, row: dict[str, Any]) -> str:
+    who = row.get("accountName") or row.get("accountId") or "?"
+    status = str(row.get("status") or "?")
+    detail = ""
+    credit = row.get("credit")
+    if isinstance(credit, (int, float)) and credit:
+        detail += f" +{credit:g} credit"
+    location = row.get("location")
+    if isinstance(location, str) and location:
+        detail += f" · {location}"
+    if row.get("departed") is True:
+        detail += " → dispatched"
+    arrive = row.get("arriveAtMs")
+    if isinstance(arrive, (int, float)) and arrive > 0:
+        detail += " · lands " + time.strftime("%m-%d %H:%M", time.localtime(arrive / 1000))
+    message = row.get("message")
+    if isinstance(message, str) and message:
+        detail += f" — {message}"
+    return f"  {_region_label(region)} · {who}: {status}{detail}"
+
+
+def _travel_card(rows: dict[str, list[dict[str, Any]]], *, status_only: bool = False) -> str:
+    lines = [
+        f"WorkBuddy 派猫猫 · {_today()}" + (" · status only (nothing claimed or dispatched)" if status_only else "")
+    ]
+    moved = 0
+    failed = 0
+    for name in sorted(rows):
+        region_rows = rows[name]
+        if not region_rows:
+            lines.append(f"  {_region_label(name)}: no stored account — `/workbuddy login {name}`")
+            continue
+        for row in region_rows:
+            lines.append(_travel_row_line(name, row))
+            if row.get("status") == "failed":
+                failed += 1
+            elif row.get("status") in ("claimed", "departed") or row.get("departed") is True:
+                moved += 1
+    if moved:
+        lines.append(f"{moved} account(s) claimed or dispatched this run")
+    elif not status_only:
+        lines.append("Nothing to claim or dispatch this run (traveling, or the daily cap is used up).")
+    if failed:
+        lines.append(f"{failed} account(s) failed — the upstream's words are above.")
+    lines.append(
+        "auto: on (runs once a day with the watchdog)" if _travel_auto_enabled()
+        else "auto: off — `/workbuddy travel auto on` runs the loop daily by itself"
+    )
+    return "\n".join(lines)
+
+
+def _notify_after(title: str, text: str, *, ok: bool) -> str:
+    """Push a run summary when the user configured channels; '' means silent."""
+    try:
+        return _notify.notify_report(title, text, success=ok)
+    except Exception:  # a push must never change the run's outcome
+        logger.warning("workbuddy: notify failed", exc_info=True)
+        return ""
+
+
+def _run_travel(
+    region: str = "both",
+    *,
+    status_only: bool = False,
+    location: Optional[int] = None,
+    announce: bool = True,
+) -> tuple[str, bool]:
+    """Render one travel run (and push it when configured). Returns ``(text, ok)``."""
+    rows, code, raw = _travel_report(region, status_only=status_only, location=location)
+    if not rows:
+        return raw or "workbuddy: no travel report", False
+    text = _travel_card(rows, status_only=status_only)
+    ok = not any(row.get("status") == "failed" for region_rows in rows.values() for row in region_rows)
+    if announce and not status_only:
+        note = _notify_after("WorkBuddy 派猫猫", text, ok=ok)
+        if note:
+            text += "\n" + note
+    return text, ok
+
+
+def _travel_auto_text(mode: str = "status") -> str:
+    """Arm the daily travel loop (marker file) or report it."""
+    if mode in ("on", "off"):
+        _write_flag(TRAVEL_AUTO_MARKER, mode)
+        if mode == "on":
+            text, _ok = _run_travel("both")
+            return text + "\n\nauto: on — the watchdog runs this loop once a day from now on."
+        return "auto: off — `/workbuddy travel` still runs on demand."
+    return (
+        f"auto: {'on' if _travel_auto_enabled() else 'off'}"
+        f" · last dated run {_travel_stamp() or 'never'}"
+        f" · log {_state_dir() / TRAVEL_LOG}"
+    )
+
+
+def _auto_travel_tick() -> None:
+    """Run the travel loop once per day when armed (called from the watchdog)."""
+    if not _travel_auto_enabled():
+        return
+    today = _today()
+    if _travel_stamp() == today:
+        return
+    # Stamp first: a failure must not re-fire on every tick, and a dispatch is a
+    # write — one run per day is the whole contract.
+    _write_flag(TRAVEL_STAMP, today)
+    text, ok = _run_travel("both")
+    with contextlib.suppress(OSError):
+        _state_dir().mkdir(parents=True, exist_ok=True)
+        with (_state_dir() / TRAVEL_LOG).open("a", encoding="utf-8") as handle:
+            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ok={ok} {' '.join(text.split())}\n")
 
 
 
@@ -1100,9 +1298,38 @@ def _cmd_checkin(args: argparse.Namespace) -> int:
     if mode:
         print(_checkin_auto_text(mode))
         return 0
-    rows, code, raw = _checkin_report(getattr(args, "region", "both"))
-    print(_checkin_text(getattr(args, "region", "both")) if rows else (raw or "workbuddy: nothing checked in"))
+    region = getattr(args, "region", "both")
+    travel = bool(getattr(args, "travel", False))
+    location = getattr(args, "location", None)
+    if travel or location:
+        print(_run_checkin(region, travel=True, location=location))
+        return 0
+    rows, code, raw = _checkin_report(region)
+    print(_run_checkin(region) if rows else (raw or "workbuddy: nothing checked in"))
     return 0 if rows else code
+
+
+def _cmd_travel(args: argparse.Namespace) -> int:
+    mode = getattr(args, "auto", None)
+    if mode:
+        print(_travel_auto_text(mode))
+        return 0
+    status_only = bool(getattr(args, "status", False))
+    location = getattr(args, "location", None)
+    text, ok = _run_travel(
+        getattr(args, "region", "both"), status_only=status_only, location=location
+    )
+    print(text)
+    return 0 if ok or status_only else 1
+
+
+def _cmd_notify(args: argparse.Namespace) -> int:
+    action = str(getattr(args, "notify_action", "") or "status")
+    if action == "test":
+        print(_notify.test_text())
+        return 0
+    print(_notify.status_text())
+    return 0
 
 
 def _cmd_autostart(args: argparse.Namespace) -> int:
@@ -1171,9 +1398,11 @@ def _cmd_account(args: argparse.Namespace) -> int:
 SLASH_MENU: tuple[dict[str, str], ...] = (
     {"value": "status", "label": "Status", "description": "gateway, accounts, autostart, live model counts"},
     {"value": "checkin", "label": "Daily check-in (签到)", "description": "claim every account's daily reward — one click, safe to repeat"},
+    {"value": "travel", "label": "Buddy travel (派猫猫)", "description": "claim a landed reward, then dispatch the buddy again"},
     {"value": "account", "label": "Switch account (切换账号)", "description": "one picker across CN + global; the pick pays for requests"},
     {"value": "login", "label": "Sign in / add account (登录)", "description": "browser sign-in, stored when you finish there"},
     {"value": "aliases", "label": "Refresh models", "description": "re-read the live catalog into Hermes aliases"},
+    {"value": "notify", "label": "Push notifications (推送)", "description": "channel readiness and a test push for check-in/travel runs"},
     {"value": "autostart", "label": "Autostart on/off", "description": "keep the gateway up with Hermes"},
 )
 
@@ -1181,7 +1410,11 @@ SLASH_USAGE = """WorkBuddy — in-session settings (no model turn needed)
   /workbuddy                       status card + menu
   /workbuddy status
   /workbuddy checkin [cn|global]   claim today's reward on every account (一键签到)
+  /workbuddy checkin travel        claim, then run the 派猫猫 travel loop
   /workbuddy checkin auto [on|off] claim once a day by itself
+  /workbuddy travel [status]       Buddy travel (派猫猫): claim a landed reward, then dispatch
+  /workbuddy travel auto [on|off]  run the loop once a day by itself
+  /workbuddy notify [status|test]  push channels for check-in/travel runs (推送)
   /workbuddy account [cn|global] [<index>|<id>|<name>|clear]
   /workbuddy login [cn|global]     browser sign-in; the account is stored when you finish
   /workbuddy aliases               re-read the live catalog into Hermes model aliases
@@ -1190,7 +1423,7 @@ SLASH_USAGE = """WorkBuddy — in-session settings (no model turn needed)
   /workbuddy autostart [on|off]
   /workbuddy start | stop | restart | logs
   /workbuddy logout                delete every stored credential (asks first)
-  Chinese verbs work too: 状态 签到 账号 登录 积分"""
+  Chinese verbs work too: 状态 签到 账号 登录 积分 派猫猫 推送"""
 
 
 def _pick_region_arg(tokens: list[str]) -> Optional[str]:
@@ -1206,7 +1439,11 @@ def _slash_menu(ctx: Any) -> str:
     if not action:
         return card
     if action == "checkin":
-        return _checkin_text("both")
+        return _run_checkin("both")
+    if action == "travel":
+        return _run_travel("both")[0]
+    if action == "notify":
+        return _notify.status_text()
     if action == "login":
         return _login(_choose_region(ctx, "Sign in to which region?"))
     if action == "account":
@@ -1267,7 +1504,22 @@ def _slash_invoke(ctx: Any, raw_args: str) -> str:
         mode = next((t.lower() for t in rest if t.lower() in ("on", "off")), "")
         if mode or any(t.lower() in ("auto", "每日", "自动") for t in rest):
             return _checkin_auto_text(mode or "status")
-        return _checkin_text(region or "both")
+        wants_travel = any(t.lower() in ("travel", "旅行", "猫猫", "派猫猫") for t in rest)
+        location = next((int(t) for t in rest if t.isdigit() and 1 <= int(t) <= 4), None)
+        if wants_travel or location is not None:
+            return _run_checkin(region or "both", travel=True, location=location)
+        return _run_checkin(region or "both")
+    if verb in ("travel", "派猫猫", "旅行", "猫猫"):
+        mode = next((t.lower() for t in rest if t.lower() in ("on", "off")), "")
+        if mode or any(t.lower() in ("auto", "每日", "自动") for t in rest):
+            return _travel_auto_text(mode or "status")
+        if any(t.lower() in ("status", "state", "状态") for t in rest):
+            return _run_travel(region or "both", status_only=True)[0]
+        location = next((int(t) for t in rest if t.isdigit() and 1 <= int(t) <= 4), None)
+        return _run_travel(region or "both", location=location)[0]
+    if verb in ("notify", "push", "推送", "通知"):
+        action = next((t.lower() for t in rest if t.lower() in ("status", "test")), "")
+        return _notify.test_text() if action == "test" else _notify.status_text()
 
     if verb == "autostart":
         mode = next((t.lower() for t in rest if t.lower() in ("on", "off")), "")
@@ -1324,6 +1576,8 @@ _COMMANDS = {
     "models": _cmd_models,
     "credits": _cmd_credits,
     "checkin": _cmd_checkin,
+    "travel": _cmd_travel,
+    "notify": _cmd_notify,
     "aliases": _cmd_aliases,
     "account": _cmd_account,
     "autostart": _cmd_autostart,
@@ -1354,6 +1608,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     for name, help_text in (
         ("credits", "Per-account remaining credit"),
         ("checkin", "Claim every account's daily reward (one click)"),
+        ("travel", "Buddy travel (派猫猫): claim a landed reward, then dispatch"),
     ):
         sub = subs.add_parser(name, help=help_text)
         sub.add_argument("--region", choices=("cn", "global", "both"), default="both")
@@ -1363,6 +1618,18 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                 choices=("on", "off", "status"),
                 help="Claim once a day by itself (on|off) or report that mode",
             )
+            sub.add_argument("--travel", action="store_true", help="Also run the travel loop")
+            sub.add_argument("--location", type=int, choices=(1, 2, 3, 4), help="Travel destination id")
+        if name == "travel":
+            sub.add_argument("--status", action="store_true", help="Read-only: claim and dispatch nothing")
+            sub.add_argument("--location", type=int, choices=(1, 2, 3, 4), help="Destination id (default: random)")
+            sub.add_argument(
+                "--auto",
+                choices=("on", "off", "status"),
+                help="Run the loop once a day by itself (on|off) or report that mode",
+            )
+    notify = subs.add_parser("notify", help="Message push for check-in/travel runs (status|test)")
+    notify.add_argument("notify_action", nargs="?", choices=("status", "test"), default="status")
     account = subs.add_parser("account", help="List, select, or clear a region's billing account")
     account.add_argument("account", nargs="?", help="Account id or name (omit to list)")
     account.add_argument("--region", choices=("cn", "global"), default="cn")

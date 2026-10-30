@@ -27,6 +27,12 @@
 | `workbuddy2api` | <https://github.com/Sliverkiss/workbuddy2api> | WorkBuddy 上游协议（`copilot.tencent.com` 的 wire behavior）的参照实现 | **MIT** |
 | `workbuddy2api`（DSML 解析器） | <https://github.com/hawklithm/workbuddy2api> | **代码移植**（本清单中唯一一项不只是思路参照）：`src/codebuddy_proxy/dsml_parser.py` 的标签状态机、忽略区域判定（Markdown 围栏 / 行内代码 / CDATA / 注释）、缺包裹修复、参数递归解析与流式缓冲，移植为 `src/dsml-recovery.ts`；并在其上补了该实现没有的两道闸（工具名必须在本次请求声明的工具里、无声明工具完全不做恢复）。逐条改动与理由见该文件头部注释与 `docs/DSML-RECOVERY-PLAN.md` | **MIT**（Copyright (c) 2026 Mayer） |
 
+### 与 WorkBuddy 活动能力（签到 / 派猫猫 / 推送）相关
+
+| 项目 | 仓库 | 参考内容 | 许可证 |
+| --- | --- | --- | --- |
+| `totorosir-workbuddy-checkin`（SkillHub 技能包） | <https://skillhub.cn>（作者 totorosir） | **仅参考其公开文档**：Buddy 加油站签到与派猫猫旅行的接口路径、域名差异（旅行走 `www.workbuddy.cn`、无 `/v2` 前缀）、`location_id` 为必填、`no active buddy` 属账号状态、以及"先领后派"的顺序与十二条推送渠道清单。`gateway/src` 的 travel 实现与 `notify.py` 为独立编写，**未复制该技能的源码**（其 `scripts/*.py` 也未随本包分发） | 该技能未声明许可证；本包不包含其代码，故不构成再分发 |
+
 ### 与 DSH 插件结构 / 外观相关
 
 | 项目 | 仓库 | 参考内容 | 许可证 |

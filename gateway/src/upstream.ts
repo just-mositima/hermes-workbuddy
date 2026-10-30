@@ -307,6 +307,27 @@ export interface WorkBuddyCheckinClaim {
 }
 
 /**
+ * Buddy travel (派猫猫旅行) state.
+ *
+ * Travel is a SEPARATE activity from the credit meter: its endpoints live under
+ * `/activity/growth/buddy/travel` with no `/v2` prefix, and on the domestic
+ * region they are served by `www.workbuddy.cn` rather than the billing host the
+ * credential's `domain` names. Using the billing host there answers 404.
+ */
+export interface WorkBuddyTravelStatus {
+  /** `idle` can depart, `traveling` is out, `arrived` has a reward to claim. */
+  state: 'idle' | 'traveling' | 'arrived' | 'unknown'
+  /** The server's own daily dispatch cap for this account. */
+  dailyLimitReached: boolean
+  /** Reward waiting to be claimed, when the upstream states one. */
+  rewardCredit?: number
+  /** Human-readable destination of the current/last trip. */
+  location?: string
+  /** Arrival instant (epoch ms), when the upstream states one. */
+  arriveAtMs?: number
+}
+
+/**
  * One promotional benefit the account may or may not still be entitled to.
  *
  * Read from the billing gateway's OWN status endpoints — the same two the
@@ -1526,6 +1547,22 @@ function chatBase(credential: WorkBuddyCredential): string {
 function billingBase(credential: WorkBuddyCredential): string {
   return regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_BILLING_BASE
 }
+
+/**
+ * The Buddy-travel host for this credential.
+ *
+ * Domestic travel is served by `www.workbuddy.cn` — NOT by the credential's own
+ * billing host (`www.codebuddy.cn`), which answers 404 for `/activity/…`. The
+ * global region serves travel from the same brand host it bills from.
+ */
+const CN_TRAVEL_BASE = 'https://www.workbuddy.cn'
+
+function travelBase(credential: WorkBuddyCredential): string {
+  return regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_TRAVEL_BASE
+}
+
+/** The four travel destinations; identical duration and reward ranges. */
+const TRAVEL_LOCATION_IDS = 4
 
 function originReferer(credential: WorkBuddyCredential): string {
   return regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_BILLING_BASE
@@ -3234,6 +3271,23 @@ function parseEnterpriseInstant(value: string): number | undefined {
 }
 
 /**
+ * A timestamp the activity endpoints may state as epoch ms, epoch seconds, or a
+ * date string. Travel reports `arrive_at` and friends loosely; an unreadable
+ * value must degrade to "unknown", never to a wrong instant.
+ */
+function instantOf(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value > 1e12 ? value : value * 1000
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000
+    return parseEnterpriseInstant(value)
+  }
+  return undefined
+}
+
+/**
  * Fail an envelope whose business code is non-zero, classified like HTTP errors.
  *
  * A JSON body on a 401/403 is still a credential refusal: the edge answered in
@@ -3255,6 +3309,23 @@ function envelopeError(status: number, envelope: Envelope): Error {
   if (status === 401 || status === 403) return new WorkBuddyCredentialRejectedError(status)
   const kind = classifyUpstreamError(status, `{"code":${envelope.code},"msg":${JSON.stringify(envelope.msg)}}`)
   return new Error(`workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`)
+}
+
+/**
+ * The activity endpoints' own error shape.
+ *
+ * They answer **403 for a feature the account never enabled** (`no active
+ * buddy` on a dispatch) — the same status a dead token earns. Collapsing both
+ * into "re-sign in" sends the user to fix the wrong thing, so a recognizable
+ * account-state message keeps its own words; everything else classifies exactly
+ * like a billing call.
+ */
+function travelEnvelopeError(status: number, envelope: Envelope): Error {
+  const msg = envelope.msg.slice(0, 160)
+  if (/no active buddy|buddy is not active|not active|未激活/iu.test(msg)) {
+    return new Error(`workbuddy travel: ${msg}`)
+  }
+  return envelopeError(status, envelope)
 }
 
 /**
@@ -4279,6 +4350,92 @@ export class WorkBuddyUpstreamClient {
       streakDays: numberField('streak_days'),
       isStreakDay: data['is_streak_day'] === true,
     }
+  }
+
+  /**
+   * Buddy travel state for one credential (read-only).
+   *
+   * `arrived` means a reward is waiting: it does not expire, so a run that only
+   * reads the state still loses nothing — the next run claims it.
+   */
+  async fetchTravelStatus(credential: WorkBuddyCredential): Promise<WorkBuddyTravelStatus> {
+    const response = await fetch(`${travelBase(credential)}/activity/growth/buddy/travel/status`, {
+      method: 'GET',
+      headers: billingHeaders(credential),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw travelEnvelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const rawState = typeof data['state'] === 'string' ? data['state'] : ''
+    const state = rawState === 'idle' || rawState === 'traveling' || rawState === 'arrived'
+      ? rawState
+      : 'unknown'
+    const place = typeof data['location'] === 'object' && data['location'] !== null
+      ? (data['location'] as Record<string, unknown>)
+      : {}
+    const locationName = typeof place['name'] === 'string' && place['name'] !== '' ? place['name'] : undefined
+    const arriveAtMs = instantOf(data['arrive_at'])
+    const reward = typeof data['reward_credit'] === 'number' ? data['reward_credit'] : undefined
+    return {
+      state,
+      dailyLimitReached: data['daily_limit_reached'] === true,
+      ...reward === undefined ? {} : { rewardCredit: reward },
+      ...locationName === undefined ? {} : { location: locationName },
+      ...arriveAtMs === undefined ? {} : { arriveAtMs },
+    }
+  }
+
+  /** Claim the travel reward of an `arrived` buddy. */
+  async claimTravelReward(credential: WorkBuddyCredential): Promise<{ credit: number }> {
+    const response = await fetch(`${travelBase(credential)}/activity/growth/buddy/travel/claim`, {
+      method: 'POST',
+      headers: billingHeaders(credential),
+      body: '{}',
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw travelEnvelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const credit = typeof data['credit'] === 'number'
+      ? data['credit']
+      : typeof data['reward_credit'] === 'number' ? data['reward_credit'] : 0
+    return { credit }
+  }
+
+  /**
+   * Dispatch the buddy (派猫猫).
+   *
+   * `location_id` is REQUIRED by the upstream: an empty body answers
+   * `400 invalid request`, so "random" is a CLIENT-side choice — four
+   * destinations with identical duration and reward ranges.
+   *
+   * The caller must have checked {@link WorkBuddyTravelStatus.dailyLimitReached}
+   * first: this is a write, and the upstream's own cap is the only thing that
+   * should stop it.
+   */
+  async departBuddy(credential: WorkBuddyCredential, locationId?: number): Promise<{ location?: string }> {
+    const target = locationId ?? 1 + Math.floor(Math.random() * TRAVEL_LOCATION_IDS)
+    const response = await fetch(`${travelBase(credential)}/activity/growth/buddy/travel/depart`, {
+      method: 'POST',
+      headers: billingHeaders(credential),
+      body: JSON.stringify({ location_id: target }),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw travelEnvelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const place = typeof data['location'] === 'object' && data['location'] !== null
+      ? (data['location'] as Record<string, unknown>)
+      : {}
+    const name = typeof place['name'] === 'string' && place['name'] !== '' ? place['name'] : undefined
+    return name === undefined ? {} : { location: name }
   }
 
   /**

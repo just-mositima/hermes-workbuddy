@@ -45,7 +45,7 @@ import {
   writeSelection,
   type GatewayStateDocument,
 } from './gateway.ts'
-import { checkinAllAccounts } from './account-pool-run.ts'
+import { checkinAllAccounts, travelAllAccounts } from './account-pool-run.ts'
 import { oauthPoll, oauthStart } from './oauth.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, readHostHeartbeat, workbuddyHostHeartbeatPath } from './host-heartbeat.ts'
@@ -53,10 +53,12 @@ import { piAiRuntimeInfo } from './pi-ai-runtime.ts'
 import { hostPeersInfo } from './host-peers.ts'
 import { describeRosterSeenPayload, isKnownRosterSeenVersion, rosterSeenPath } from './roster-seen-store.ts'
 
-type Action = 'doctor' | 'logout' | 'status' | 'serve' | 'models' | 'credits' | 'checkin' | 'account' | 'login'
+type Action = 'doctor' | 'logout' | 'status' | 'serve' | 'models' | 'credits' | 'checkin' | 'travel' | 'account' | 'login'
 
 /** Actions added for standalone (host-less) use, e.g. behind Hermes. */
-const STANDALONE_ACTIONS: ReadonlySet<string> = new Set(['serve', 'models', 'credits', 'checkin', 'account', 'login'])
+const STANDALONE_ACTIONS: ReadonlySet<string> = new Set([
+  'serve', 'models', 'credits', 'checkin', 'travel', 'account', 'login',
+])
 
 /**
  * Version of the `doctor --json` document.
@@ -113,6 +115,9 @@ function printHelp(): void {
     '  account   list / select the billing account for a region',
     '            --region cn|global (default cn)  [list] [<id|name>]  --clear',
     '  credits   per-account remaining credit   --region cn|global|both (default both) --json',
+    '  travel    Buddy travel (派猫猫): claim a landed reward, then dispatch   --region cn|global|both',
+    '            --status (read-only: report the trip, claim nothing)   --location 1-4   --json',
+    '',
     '  checkin   claim every account\'s daily reward   --region cn|global|both (default both) --json',
     '',
     'Diagnostics (unchanged from the original plugin):',
@@ -727,6 +732,82 @@ async function checkinCommand(argv: readonly string[]): Promise<number> {
 }
 
 /**
+ * `workbuddy travel` — Buddy travel (派猫猫) on every stored account.
+ *
+ * A guardrail, not a nicety: the closed loop claims an `arrived` reward FIRST
+ * and only then dispatches, because an unclaimed landing blocks a departure and
+ * a reward that is never claimed is simply lost (the server keeps `arrived`,
+ * but the next trip never starts).
+ *
+ * Exit code: 0 when at least one account ended in a better state than it
+ * started (claimed / departed), 1 otherwise — `traveling` and `limit` are normal
+ * steady states, not errors, so a run that finds them exits 1 only to say "this
+ * run changed nothing".
+ */
+async function travelCommand(argv: readonly string[]): Promise<number> {
+  const { flags, values } = parseFlags(argv)
+  const regions = parseRegions(values.get('region'), GATEWAY_REGIONS)
+  const readOnly = flags.has('status') || flags.has('check-only')
+  const rawLocation = values.get('location')
+  let locationId: number | undefined
+  if (rawLocation !== undefined) {
+    const parsed = Number(rawLocation)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 4) {
+      throw new Error(`--location must be an integer in 1..4; got ${JSON.stringify(rawLocation)}`)
+    }
+    locationId = parsed
+  }
+  const client = new WorkBuddyUpstreamClient()
+  const report: Record<string, unknown> = {}
+  const lines: string[] = []
+  let anyChange = false
+  for (const region of regions) {
+    const store = makeStore(region)
+    const accounts = await store.accounts()
+    const rows = await travelAllAccounts(
+      accounts.map(account => ({
+        accountId: account.id,
+        accountName: account.accountName,
+        ...account.enterprise === undefined ? {} : { enterprise: account.enterprise },
+      })),
+      {
+        credentialFor: accountId => store.credentialFor(accountId),
+        fetchTravelStatus: credential => client.fetchTravelStatus(credential),
+        claimTravelReward: credential => client.claimTravelReward(credential),
+        departBuddy: (credential, id) => client.departBuddy(credential, id),
+      },
+      {
+        readOnly,
+        ...locationId === undefined ? {} : { locationId },
+      },
+    )
+    for (const row of rows) {
+      if (row.status === 'claimed' || row.status === 'departed' || row.departed === true) anyChange = true
+    }
+    report[region] = rows
+    lines.push(
+      `${REGION_LABELS[region]}:`,
+      ...rows.length === 0
+        ? ['  (no local accounts)']
+        : rows.map(row => [
+          `  ${row.accountName === '' ? row.accountId : row.accountName}: ${row.status}`,
+          row.credit === undefined ? '' : ` +${row.credit}`,
+          row.departed === true && row.status === 'claimed' ? ' → dispatched' : '',
+          row.location === undefined ? '' : ` · ${row.location}`,
+          row.arriveAtMs === undefined ? '' : ` · lands ${new Date(row.arriveAtMs).toISOString().replace('T', ' ').slice(0, 16)}`,
+          row.message === undefined ? '' : ` — ${row.message}`,
+        ].join('')),
+    )
+  }
+  if (flags.has('json') || values.has('json')) {
+    printJson(report)
+    return 0
+  }
+  process.stdout.write(`${lines.join('\n')}\n`)
+  return anyChange ? 0 : 1
+}
+
+/**
  * `workbuddy login` — add an account by signing in through the browser,
  * with no desktop app and no credential file to copy.
  *
@@ -883,6 +964,8 @@ export async function run(argv: readonly string[]): Promise<number> {
           return await creditsCommand(flags)
         case 'checkin':
           return await checkinCommand(flags)
+        case 'travel':
+          return await travelCommand(flags)
         case 'account':
           return await accountCommand(flags)
         case 'login':
@@ -897,7 +980,7 @@ export async function run(argv: readonly string[]): Promise<number> {
   }
   const actions: readonly Action[] = ['doctor', 'logout', 'status']
   if (!actions.includes(rawAction as Action)) {
-    process.stderr.write(`workbuddy: unknown command ${JSON.stringify(rawAction)}; expected serve, models, account, credits, checkin, doctor, status, or logout (see --help)\n`)
+    process.stderr.write(`workbuddy: unknown command ${JSON.stringify(rawAction)}; expected serve, models, account, credits, checkin, travel, doctor, status, or logout (see --help)\n`)
     return 1
   }
   const action = rawAction as Action

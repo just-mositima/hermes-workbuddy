@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { B as piAiRuntimeInfo, D as cooldownOf, G as deriveCatalog, H as FALLBACK_WORKBUDDY_MODELS_GLOBAL, I as createWorkBuddyShim, K as fallbackModelsFor, P as redactUpstreamText, Qt as WORKBUDDY_APP_EXECUTABLE_ENV, U as WorkBuddyCatalog, V as FALLBACK_WORKBUDDY_MODELS, X as WORKBUDDY_AUTH_FILE_ENV, Z as WorkBuddyCredentialStore, a as readHostHeartbeat, b as checkinAllAccounts, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, et as defaultDesktopAuthCandidates, f as readPoolProbes, fn as hostPeersInfo, h as oauthStart, in as findWorkbuddyAppExecutableWithSource, k as outcomeOfFailure, m as oauthPoll, mt as WorkBuddyUpstreamClient, o as workbuddyHostHeartbeatPath, ot as legacyWorkbuddyOwnAuthPath, p as writePoolProbes, pn as writeFileAtomic, r as isHeartbeatProcessAlive, tt as defaultDesktopAuthDirs, u as describeRosterSeenPayload, ut as workbuddyOwnAuthPath, v as rankPool, vt as modelIdOfBody } from "./host-heartbeat-7Q5C3Dls.js";
+import { $t as WORKBUDDY_APP_EXECUTABLE_ENV, A as outcomeOfFailure, C as travelAllAccounts, F as redactUpstreamText, H as FALLBACK_WORKBUDDY_MODELS, K as deriveCatalog, L as createWorkBuddyShim, O as cooldownOf, Q as WorkBuddyCredentialStore, U as FALLBACK_WORKBUDDY_MODELS_GLOBAL, V as piAiRuntimeInfo, W as WorkBuddyCatalog, Z as WORKBUDDY_AUTH_FILE_ENV, a as readHostHeartbeat, an as findWorkbuddyAppExecutableWithSource, b as checkinAllAccounts, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, dt as workbuddyOwnAuthPath, f as readPoolProbes, h as oauthStart, ht as WorkBuddyUpstreamClient, m as oauthPoll, mn as writeFileAtomic, nt as defaultDesktopAuthDirs, o as workbuddyHostHeartbeatPath, p as writePoolProbes, pn as hostPeersInfo, q as fallbackModelsFor, r as isHeartbeatProcessAlive, st as legacyWorkbuddyOwnAuthPath, tt as defaultDesktopAuthCandidates, u as describeRosterSeenPayload, v as rankPool, yt as modelIdOfBody } from "./host-heartbeat-DUEu7bdr.js";
 import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -498,6 +498,7 @@ const STANDALONE_ACTIONS = /* @__PURE__ */ new Set([
 	"models",
 	"credits",
 	"checkin",
+	"travel",
 	"account",
 	"login"
 ]);
@@ -549,6 +550,9 @@ function printHelp() {
 		"  account   list / select the billing account for a region",
 		"            --region cn|global (default cn)  [list] [<id|name>]  --clear",
 		"  credits   per-account remaining credit   --region cn|global|both (default both) --json",
+		"  travel    Buddy travel (派猫猫): claim a landed reward, then dispatch   --region cn|global|both",
+		"            --status (read-only: report the trip, claim nothing)   --location 1-4   --json",
+		"",
 		"  checkin   claim every account's daily reward   --region cn|global|both (default both) --json",
 		"",
 		"Diagnostics (unchanged from the original plugin):",
@@ -1047,6 +1051,68 @@ async function checkinCommand(argv) {
 	return anySuccess ? 0 : 1;
 }
 /**
+* `workbuddy travel` — Buddy travel (派猫猫) on every stored account.
+*
+* A guardrail, not a nicety: the closed loop claims an `arrived` reward FIRST
+* and only then dispatches, because an unclaimed landing blocks a departure and
+* a reward that is never claimed is simply lost (the server keeps `arrived`,
+* but the next trip never starts).
+*
+* Exit code: 0 when at least one account ended in a better state than it
+* started (claimed / departed), 1 otherwise — `traveling` and `limit` are normal
+* steady states, not errors, so a run that finds them exits 1 only to say "this
+* run changed nothing".
+*/
+async function travelCommand(argv) {
+	const { flags, values } = parseFlags(argv);
+	const regions = parseRegions(values.get("region"), GATEWAY_REGIONS);
+	const readOnly = flags.has("status") || flags.has("check-only");
+	const rawLocation = values.get("location");
+	let locationId;
+	if (rawLocation !== void 0) {
+		const parsed = Number(rawLocation);
+		if (!Number.isInteger(parsed) || parsed < 1 || parsed > 4) throw new Error(`--location must be an integer in 1..4; got ${JSON.stringify(rawLocation)}`);
+		locationId = parsed;
+	}
+	const client = new WorkBuddyUpstreamClient();
+	const report = {};
+	const lines = [];
+	let anyChange = false;
+	for (const region of regions) {
+		const store = makeStore(region);
+		const accounts = await store.accounts();
+		const rows = await travelAllAccounts(accounts.map((account) => ({
+			accountId: account.id,
+			accountName: account.accountName,
+			...account.enterprise === void 0 ? {} : { enterprise: account.enterprise }
+		})), {
+			credentialFor: (accountId) => store.credentialFor(accountId),
+			fetchTravelStatus: (credential) => client.fetchTravelStatus(credential),
+			claimTravelReward: (credential) => client.claimTravelReward(credential),
+			departBuddy: (credential, id) => client.departBuddy(credential, id)
+		}, {
+			readOnly,
+			...locationId === void 0 ? {} : { locationId }
+		});
+		for (const row of rows) if (row.status === "claimed" || row.status === "departed" || row.departed === true) anyChange = true;
+		report[region] = rows;
+		lines.push(`${REGION_LABELS[region]}:`, ...rows.length === 0 ? ["  (no local accounts)"] : rows.map((row) => [
+			`  ${row.accountName === "" ? row.accountId : row.accountName}: ${row.status}`,
+			row.credit === void 0 ? "" : ` +${row.credit}`,
+			row.departed === true && row.status === "claimed" ? " → dispatched" : "",
+			row.location === void 0 ? "" : ` · ${row.location}`,
+			row.arriveAtMs === void 0 ? "" : ` · lands ${new Date(row.arriveAtMs).toISOString().replace("T", " ").slice(0, 16)}`,
+			row.message === void 0 ? "" : ` — ${row.message}`
+		].join("")));
+	}
+	if (flags.has("json") || values.has("json")) {
+		printJson(report);
+		return 0;
+	}
+	process.stdout.write(`${lines.join("\n")}\n`);
+	return anyChange ? 0 : 1;
+}
+/**
 * `workbuddy login` — add an account by signing in through the browser,
 * with no desktop app and no credential file to copy.
 *
@@ -1184,6 +1250,7 @@ async function run(argv) {
 			case "models": return await modelsCommand(flags);
 			case "credits": return await creditsCommand(flags);
 			case "checkin": return await checkinCommand(flags);
+			case "travel": return await travelCommand(flags);
 			case "account": return await accountCommand(flags);
 			case "login": return await loginCommand(flags);
 			default: return 1;
@@ -1197,7 +1264,7 @@ async function run(argv) {
 		"logout",
 		"status"
 	].includes(rawAction)) {
-		process.stderr.write(`workbuddy: unknown command ${JSON.stringify(rawAction)}; expected serve, models, account, credits, checkin, doctor, status, or logout (see --help)\n`);
+		process.stderr.write(`workbuddy: unknown command ${JSON.stringify(rawAction)}; expected serve, models, account, credits, checkin, travel, doctor, status, or logout (see --help)\n`);
 		return 1;
 	}
 	const action = rawAction;

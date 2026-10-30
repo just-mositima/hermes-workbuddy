@@ -3118,6 +3118,19 @@ function chatBase(credential) {
 function billingBase(credential) {
 	return regionOf(credential.domain) === "global" ? globalBase(credential.domain) : CN_BILLING_BASE$1;
 }
+/**
+* The Buddy-travel host for this credential.
+*
+* Domestic travel is served by `www.workbuddy.cn` — NOT by the credential's own
+* billing host (`www.codebuddy.cn`), which answers 404 for `/activity/…`. The
+* global region serves travel from the same brand host it bills from.
+*/
+const CN_TRAVEL_BASE = "https://www.workbuddy.cn";
+function travelBase(credential) {
+	return regionOf(credential.domain) === "global" ? globalBase(credential.domain) : CN_TRAVEL_BASE;
+}
+/** The four travel destinations; identical duration and reward ranges. */
+const TRAVEL_LOCATION_IDS = 4;
 function originReferer(credential) {
 	return regionOf(credential.domain) === "global" ? globalBase(credential.domain) : CN_BILLING_BASE$1;
 }
@@ -4453,6 +4466,19 @@ function parseEnterpriseInstant(value) {
 	return Number.isNaN(parsed) ? void 0 : parsed;
 }
 /**
+* A timestamp the activity endpoints may state as epoch ms, epoch seconds, or a
+* date string. Travel reports `arrive_at` and friends loosely; an unreadable
+* value must degrade to "unknown", never to a wrong instant.
+*/
+function instantOf(value) {
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) return value > 0xe8d4a51000 ? value : value * 1e3;
+	if (typeof value === "string" && value.trim() !== "") {
+		const numeric = Number(value);
+		if (Number.isFinite(numeric) && numeric > 0) return numeric > 0xe8d4a51000 ? numeric : numeric * 1e3;
+		return parseEnterpriseInstant(value);
+	}
+}
+/**
 * Fail an envelope whose business code is non-zero, classified like HTTP errors.
 *
 * A JSON body on a 401/403 is still a credential refusal: the edge answered in
@@ -4474,6 +4500,20 @@ function envelopeError(status, envelope) {
 	if (status === 401 || status === 403) return new WorkBuddyCredentialRejectedError(status);
 	const kind = classifyUpstreamError(status, `{"code":${envelope.code},"msg":${JSON.stringify(envelope.msg)}}`);
 	return /* @__PURE__ */ new Error(`workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`);
+}
+/**
+* The activity endpoints' own error shape.
+*
+* They answer **403 for a feature the account never enabled** (`no active
+* buddy` on a dispatch) — the same status a dead token earns. Collapsing both
+* into "re-sign in" sends the user to fix the wrong thing, so a recognizable
+* account-state message keeps its own words; everything else classifies exactly
+* like a billing call.
+*/
+function travelEnvelopeError(status, envelope) {
+	const msg = envelope.msg.slice(0, 160);
+	if (/no active buddy|buddy is not active|not active|未激活/iu.test(msg)) return /* @__PURE__ */ new Error(`workbuddy travel: ${msg}`);
+	return envelopeError(status, envelope);
 }
 /**
 * Parse the upstream's `credits` string into a multiplier.
@@ -5289,6 +5329,74 @@ var WorkBuddyUpstreamClient = class {
 			streakDays: numberField("streak_days"),
 			isStreakDay: data["is_streak_day"] === true
 		};
+	}
+	/**
+	* Buddy travel state for one credential (read-only).
+	*
+	* `arrived` means a reward is waiting: it does not expire, so a run that only
+	* reads the state still loses nothing — the next run claims it.
+	*/
+	async fetchTravelStatus(credential) {
+		const response = await fetch(`${travelBase(credential)}/activity/growth/buddy/travel/status`, {
+			method: "GET",
+			headers: billingHeaders(credential),
+			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
+		});
+		const envelope = await readEnvelope(response);
+		if (!response.ok || envelope.code !== 0) throw travelEnvelopeError(response.status, envelope);
+		const data = typeof envelope.data === "object" && envelope.data !== null ? envelope.data : {};
+		const rawState = typeof data["state"] === "string" ? data["state"] : "";
+		const state = rawState === "idle" || rawState === "traveling" || rawState === "arrived" ? rawState : "unknown";
+		const place = typeof data["location"] === "object" && data["location"] !== null ? data["location"] : {};
+		const locationName = typeof place["name"] === "string" && place["name"] !== "" ? place["name"] : void 0;
+		const arriveAtMs = instantOf(data["arrive_at"]);
+		const reward = typeof data["reward_credit"] === "number" ? data["reward_credit"] : void 0;
+		return {
+			state,
+			dailyLimitReached: data["daily_limit_reached"] === true,
+			...reward === void 0 ? {} : { rewardCredit: reward },
+			...locationName === void 0 ? {} : { location: locationName },
+			...arriveAtMs === void 0 ? {} : { arriveAtMs }
+		};
+	}
+	/** Claim the travel reward of an `arrived` buddy. */
+	async claimTravelReward(credential) {
+		const response = await fetch(`${travelBase(credential)}/activity/growth/buddy/travel/claim`, {
+			method: "POST",
+			headers: billingHeaders(credential),
+			body: "{}",
+			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
+		});
+		const envelope = await readEnvelope(response);
+		if (!response.ok || envelope.code !== 0) throw travelEnvelopeError(response.status, envelope);
+		const data = typeof envelope.data === "object" && envelope.data !== null ? envelope.data : {};
+		return { credit: typeof data["credit"] === "number" ? data["credit"] : typeof data["reward_credit"] === "number" ? data["reward_credit"] : 0 };
+	}
+	/**
+	* Dispatch the buddy (派猫猫).
+	*
+	* `location_id` is REQUIRED by the upstream: an empty body answers
+	* `400 invalid request`, so "random" is a CLIENT-side choice — four
+	* destinations with identical duration and reward ranges.
+	*
+	* The caller must have checked {@link WorkBuddyTravelStatus.dailyLimitReached}
+	* first: this is a write, and the upstream's own cap is the only thing that
+	* should stop it.
+	*/
+	async departBuddy(credential, locationId) {
+		const target = locationId ?? 1 + Math.floor(Math.random() * TRAVEL_LOCATION_IDS);
+		const response = await fetch(`${travelBase(credential)}/activity/growth/buddy/travel/depart`, {
+			method: "POST",
+			headers: billingHeaders(credential),
+			body: JSON.stringify({ location_id: target }),
+			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
+		});
+		const envelope = await readEnvelope(response);
+		if (!response.ok || envelope.code !== 0) throw travelEnvelopeError(response.status, envelope);
+		const data = typeof envelope.data === "object" && envelope.data !== null ? envelope.data : {};
+		const place = typeof data["location"] === "object" && data["location"] !== null ? data["location"] : {};
+		const name = typeof place["name"] === "string" && place["name"] !== "" ? place["name"] : void 0;
+		return name === void 0 ? {} : { location: name };
 	}
 	/**
 	* The ENTERPRISE credit table (issue #124).
@@ -11093,6 +11201,14 @@ async function probeModel(input) {
 	};
 }
 /**
+* The upstream's word for an account that never activated 派猫猫.
+*
+* `depart` answers `403 no active buddy` there. Treating it as a failure would
+* paint a healthy account red on every run and invite the user to 'fix' a
+* setting that is simply off; it is reported as `skipped` instead.
+*/
+const INACTIVE_BUDDY = /no active buddy|buddy is not active|未激活/iu;
+/**
 * Check in every account, one at a time.
 *
 * Idempotent by design (see the module note): an account already checked in
@@ -11160,6 +11276,137 @@ async function checkinOne(target, deps) {
 			credit: claim.credit,
 			streakDays: claim.streakDays
 		};
+	} catch (error) {
+		return {
+			...base,
+			status: "failed",
+			message: messageOf$1(error)
+		};
+	}
+}
+/**
+* Run the Buddy-travel closed loop on every account, one at a time.
+*
+* Order matters and is the whole point: **claim first, then dispatch**. A buddy
+* that already landed holds an unclaimed reward, and dispatching from `arrived`
+* is not allowed anyway — so claiming before deciding is what makes a single
+* run able to both collect yesterday's trip and start today's.
+*
+* Nothing is lost by not running: `arrived` states persist until claimed.
+* Never throws — every problem is a row.
+*/
+async function travelAllAccounts(targets, deps, options = {}) {
+	const rows = [];
+	let issued = 0;
+	for (const target of targets) {
+		if (issued > 0) await (deps.wait ?? defaultWait)(400);
+		issued += 1;
+		rows.push(await travelOne(target, deps, options));
+	}
+	return rows;
+}
+/** One account's trip through the closed loop, reduced to its row. */
+async function travelOne(target, deps, options) {
+	const base = {
+		accountId: target.accountId,
+		accountName: target.accountName
+	};
+	let credential;
+	try {
+		credential = await deps.credentialFor(target.accountId);
+	} catch (error) {
+		return {
+			...base,
+			status: "failed",
+			message: messageOf$1(error)
+		};
+	}
+	if (credential === void 0) return {
+		...base,
+		status: "failed",
+		message: "no stored credential for this account"
+	};
+	try {
+		let status = await deps.fetchTravelStatus(credential);
+		if (status.state === "unknown") return {
+			...base,
+			status: "skipped",
+			message: "travel is not active for this account"
+		};
+		let credit;
+		if (status.state === "arrived") {
+			if (options.readOnly === true) return {
+				...base,
+				status: "arrived",
+				...status.rewardCredit === void 0 ? {} : { credit: status.rewardCredit },
+				...status.location === void 0 ? {} : { location: status.location },
+				message: "a reward is waiting; run again without --status to claim it"
+			};
+			const claim = await deps.claimTravelReward(credential).catch((error) => {
+				const message = messageOf$1(error);
+				if (INACTIVE_BUDDY.test(message)) return void 0;
+				throw error;
+			});
+			if (claim === void 0) return {
+				...base,
+				status: "skipped",
+				message: "no active buddy — 派猫猫 is not activated on this account"
+			};
+			credit = claim.credit;
+			status = await deps.fetchTravelStatus(credential);
+		}
+		const carried = {
+			...credit === void 0 ? {} : { credit },
+			...status.location === void 0 ? {} : { location: status.location }
+		};
+		if (status.state === "traveling") return {
+			...base,
+			status: "traveling",
+			...carried,
+			...status.arriveAtMs === void 0 ? {} : { arriveAtMs: status.arriveAtMs }
+		};
+		if (status.state === "arrived") return {
+			...base,
+			status: "arrived",
+			...carried,
+			message: "still reporting a reward after the claim"
+		};
+		if (options.readOnly === true) return {
+			...base,
+			status: "idle",
+			...carried
+		};
+		if (status.dailyLimitReached) return {
+			...base,
+			status: "limit",
+			...carried,
+			message: "today's dispatch cap is used up"
+		};
+		try {
+			const departure = await deps.departBuddy(credential, options.locationId);
+			return {
+				...base,
+				status: credit === void 0 ? "departed" : "claimed",
+				departed: true,
+				...carried,
+				...departure.location === void 0 ? {} : { location: departure.location }
+			};
+		} catch (error) {
+			const message = messageOf$1(error);
+			if (INACTIVE_BUDDY.test(message)) return {
+				...base,
+				status: credit === void 0 ? "skipped" : "claimed",
+				...carried,
+				message: credit === void 0 ? "no active buddy — 派猫猫 is not activated on this account" : "claimed the reward; dispatch skipped (no active buddy)"
+			};
+			if (credit !== void 0) return {
+				...base,
+				status: "claimed",
+				...carried,
+				message: `claim succeeded, dispatch failed: ${message}`
+			};
+			throw error;
+		}
 	} catch (error) {
 		return {
 			...base,
@@ -12425,4 +12672,4 @@ async function clearHostHeartbeat() {
 	await rm(workbuddyHostHeartbeatPath(), { force: true });
 }
 //#endregion
-export { authFileName as $, clearAtRestKeyCache as $t, parseRetryAfter as A, recordRefusal as At, piAiRuntimeInfo as B, IMAGE_TAG_TEXT_TO_IMAGE as Bt, DEFAULT_PROBE_INPUT_TOKENS as C, regionOf as Ct, cooldownOf as D, lastRefusalFor as Dt, PROBE_SYSTEM_PROMPT as E, defaultOffModelIds as Et, resolveProbeInputTokens as F, parseSupportedSecondsRange as Ft, deriveCatalog as G, isBareBase64Image as Gt, FALLBACK_WORKBUDDY_MODELS_GLOBAL as H, WorkBuddyImageError as Ht, createWorkBuddyShim as I, pickVideoModel as It, ENCRYPTED_CREDENTIAL_CODE as J, sniffImageMime as Jt, fallbackModelsFor as K, parseImageDataUrl as Kt, hostMatchesListener as L, resolveVideoParams as Lt, probeRequestBody as M, VIDEO_TAG_IMAGE_TO_VIDEO as Mt, probeSucceeded as N, VIDEO_TAG_TEXT_TO_VIDEO as Nt, creditOfStream as O, offDefaultFor as Ot, redactUpstreamText as P, WorkBuddyVideoError as Pt, WorkBuddyEncryptedCredentialError as Q, WORKBUDDY_APP_EXECUTABLE_ENV as Qt, originIsLoopback as R, DEFAULT_IMAGE_SIZE as Rt, testAllAccounts as S, prepareChatBody as St, PROBE_MAX_TOKENS as T, REFUSES_OFF_MODEL_IDS as Tt, WorkBuddyCatalog as U, imageDataUrl as Ut, FALLBACK_WORKBUDDY_MODELS as V, MAX_INPUT_IMAGE_BYTES as Vt, applyContextBudgets as W, imageMimeForPath as Wt, WORKBUDDY_AUTH_FILE_ENV as X, imageDefaultFor as Xt, WORKBUDDY_AUTH_FILENAME as Y, NATIVE_MODALITY_BY_MODEL_ID as Yt, WorkBuddyCredentialStore as Z, nativeModalityOf as Zt, exclusionOf as _, knownRegionOf as _t, readHostHeartbeat as a, isEncryptedFieldWrapper as an, isVaultAccountId as at, checkinAllAccounts as b, parseReasoning as bt, WORKBUDDY_CONNECT_VERSION as c, macosNestedAppBundles as cn, preferredAccountName as ct, rosterSeenPath as d, workbuddyAppExecutableCandidates as dn, CREDENTIAL_REJECTED_CODE as dt, deriveAtRestKey as en, defaultDesktopAuthCandidates as et, readPoolProbes as f, hostPeersInfo as fn, WORKBUDDY_FALLBACK_SYSTEM_PROMPT as ft, effectiveMembersOf as g, isCredentialRejectedError as gt, oauthStart as h, classifyUpstreamError as ht, processStartTimeMs as i, findWorkbuddyAppExecutableWithSource as in, isEncryptedCredentialError as it, probeModel as j, withEffectiveOff as jt, outcomeOfFailure as k, offRefused as kt, createFileRosterSeenStore as l, openEncryptedField as ln, workbuddyAccountId as lt, oauthPoll as m, WorkBuddyUpstreamClient as mt, clearHostHeartbeat as n, fetchAtRestKeyPayload as nn, defaultDesktopAuthPath as nt, workbuddyHostHeartbeatPath as o, isWorkbuddyBundle as on, legacyWorkbuddyOwnAuthPath as ot, writePoolProbes as p, writeFileAtomic as pn, WorkBuddyCredentialRejectedError as pt, withoutRouters as q, pickMediaModel as qt, isHeartbeatProcessAlive as r, findWorkbuddyAppExecutable as rn, hasEncryptedCredentialFields as rt, writeHostHeartbeat as s, macosBundleExecutable as sn, parseWorkBuddyAuth as st, WORKBUDDY_HOST_HEARTBEAT_FILENAME as t, deriveAtRestKeyId as tn, defaultDesktopAuthDirs as tt, describeRosterSeenPayload as u, readAtRestKey as un, workbuddyOwnAuthPath as ut, rankPool as v, modelIdOfBody as vt, PROBE_INPUT_TOKEN_CHOICES as w, attachBusyLevels as wt, probeUpdatesOf as x, parseUpstreamModel as xt, resolveTargetModel as y, parseCreditMultiplier as yt, recordBodyReport as z, IMAGE_TAG_IMAGE_TO_IMAGE as zt };
+export { WorkBuddyEncryptedCredentialError as $, WORKBUDDY_APP_EXECUTABLE_ENV as $t, outcomeOfFailure as A, offRefused as At, recordBodyReport as B, IMAGE_TAG_IMAGE_TO_IMAGE as Bt, travelAllAccounts as C, prepareChatBody as Ct, PROBE_SYSTEM_PROMPT as D, defaultOffModelIds as Dt, PROBE_MAX_TOKENS as E, REFUSES_OFF_MODEL_IDS as Et, redactUpstreamText as F, WorkBuddyVideoError as Ft, applyContextBudgets as G, imageMimeForPath as Gt, FALLBACK_WORKBUDDY_MODELS as H, MAX_INPUT_IMAGE_BYTES as Ht, resolveProbeInputTokens as I, parseSupportedSecondsRange as It, withoutRouters as J, pickMediaModel as Jt, deriveCatalog as K, isBareBase64Image as Kt, createWorkBuddyShim as L, pickVideoModel as Lt, probeModel as M, withEffectiveOff as Mt, probeRequestBody as N, VIDEO_TAG_IMAGE_TO_VIDEO as Nt, cooldownOf as O, lastRefusalFor as Ot, probeSucceeded as P, VIDEO_TAG_TEXT_TO_VIDEO as Pt, WorkBuddyCredentialStore as Q, nativeModalityOf as Qt, hostMatchesListener as R, resolveVideoParams as Rt, testAllAccounts as S, parseUpstreamModel as St, PROBE_INPUT_TOKEN_CHOICES as T, attachBusyLevels as Tt, FALLBACK_WORKBUDDY_MODELS_GLOBAL as U, WorkBuddyImageError as Ut, piAiRuntimeInfo as V, IMAGE_TAG_TEXT_TO_IMAGE as Vt, WorkBuddyCatalog as W, imageDataUrl as Wt, WORKBUDDY_AUTH_FILENAME as X, NATIVE_MODALITY_BY_MODEL_ID as Xt, ENCRYPTED_CREDENTIAL_CODE as Y, sniffImageMime as Yt, WORKBUDDY_AUTH_FILE_ENV as Z, imageDefaultFor as Zt, exclusionOf as _, isCredentialRejectedError as _t, readHostHeartbeat as a, findWorkbuddyAppExecutableWithSource as an, isEncryptedCredentialError as at, checkinAllAccounts as b, parseCreditMultiplier as bt, WORKBUDDY_CONNECT_VERSION as c, macosBundleExecutable as cn, parseWorkBuddyAuth as ct, rosterSeenPath as d, readAtRestKey as dn, workbuddyOwnAuthPath as dt, clearAtRestKeyCache as en, authFileName as et, readPoolProbes as f, workbuddyAppExecutableCandidates as fn, CREDENTIAL_REJECTED_CODE as ft, effectiveMembersOf as g, classifyUpstreamError as gt, oauthStart as h, WorkBuddyUpstreamClient as ht, processStartTimeMs as i, findWorkbuddyAppExecutable as in, hasEncryptedCredentialFields as it, parseRetryAfter as j, recordRefusal as jt, creditOfStream as k, offDefaultFor as kt, createFileRosterSeenStore as l, macosNestedAppBundles as ln, preferredAccountName as lt, oauthPoll as m, writeFileAtomic as mn, WorkBuddyCredentialRejectedError as mt, clearHostHeartbeat as n, deriveAtRestKeyId as nn, defaultDesktopAuthDirs as nt, workbuddyHostHeartbeatPath as o, isEncryptedFieldWrapper as on, isVaultAccountId as ot, writePoolProbes as p, hostPeersInfo as pn, WORKBUDDY_FALLBACK_SYSTEM_PROMPT as pt, fallbackModelsFor as q, parseImageDataUrl as qt, isHeartbeatProcessAlive as r, fetchAtRestKeyPayload as rn, defaultDesktopAuthPath as rt, writeHostHeartbeat as s, isWorkbuddyBundle as sn, legacyWorkbuddyOwnAuthPath as st, WORKBUDDY_HOST_HEARTBEAT_FILENAME as t, deriveAtRestKey as tn, defaultDesktopAuthCandidates as tt, describeRosterSeenPayload as u, openEncryptedField as un, workbuddyAccountId as ut, rankPool as v, knownRegionOf as vt, DEFAULT_PROBE_INPUT_TOKENS as w, regionOf as wt, probeUpdatesOf as x, parseReasoning as xt, resolveTargetModel as y, modelIdOfBody as yt, originIsLoopback as z, DEFAULT_IMAGE_SIZE as zt };

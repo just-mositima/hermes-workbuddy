@@ -22,7 +22,7 @@
 import type { WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyPoolProbe } from './account-pool.ts'
 import type { WorkBuddyProbeResult } from './probe.ts'
-import type { WorkBuddyCheckinStatus } from './upstream.ts'
+import type { WorkBuddyCheckinStatus, WorkBuddyTravelStatus } from './upstream.ts'
 
 /** One account's check-in outcome. */
 export interface WorkBuddyPoolCheckinRow {
@@ -42,6 +42,45 @@ export interface WorkBuddyPoolTestRow {
   accountId: string
   accountName: string
   result: WorkBuddyProbeResult
+}
+
+/**
+ * One account's Buddy-travel outcome.
+ *
+ * `status` is the CLOSED-LOOP result of the run, not a raw upstream field:
+ *
+ * | value | meaning |
+ * |---|---|
+ * | `claimed`   | an `arrived` reward was claimed this run |
+ * | `departed`  | the buddy was dispatched this run (after any claim) |
+ * | `traveling` | out already; nothing to do until it lands |
+ * | `limit`     | today's dispatch cap is used up (the server's own cap) |
+ * | `idle`      | idle but no dispatch was attempted (read-only run) |
+ * | `skipped`   | the account is not eligible (see `message`) |
+ * | `failed`    | the upstream refused; `message` carries its words |
+ */
+export interface WorkBuddyPoolTravelRow {
+  accountId: string
+  accountName: string
+  status: 'claimed' | 'departed' | 'arrived' | 'traveling' | 'limit' | 'idle' | 'skipped' | 'failed'
+  /** Credits gained by this run's claim, when the upstream stated a figure. */
+  credit?: number
+  /** True when this run also dispatched the buddy (after claiming). */
+  departed?: boolean
+  /** Destination of the departure or of the trip in flight. */
+  location?: string
+  /** Arrival instant (epoch ms) of a trip in flight. */
+  arriveAtMs?: number
+  message?: string
+}
+
+/** What the travel batch needs from the Host, injected so it stays testable. */
+export interface WorkBuddyPoolTravelDeps {
+  credentialFor(accountId: string): Promise<WorkBuddyCredential | undefined>
+  fetchTravelStatus(credential: WorkBuddyCredential): Promise<WorkBuddyTravelStatus>
+  claimTravelReward(credential: WorkBuddyCredential): Promise<{ credit: number }>
+  departBuddy(credential: WorkBuddyCredential, locationId?: number): Promise<{ location?: string }>
+  wait?: (ms: number) => Promise<void>
 }
 
 /** One pool member as the batch runner addresses it. */
@@ -89,6 +128,15 @@ export interface WorkBuddyPoolRunnerDeps {
  * is modest politeness rather than a rate-limit workaround.
  */
 export const POOL_BATCH_GAP_MS = 400
+
+/**
+ * The upstream's word for an account that never activated 派猫猫.
+ *
+ * `depart` answers `403 no active buddy` there. Treating it as a failure would
+ * paint a healthy account red on every run and invite the user to 'fix' a
+ * setting that is simply off; it is reported as `skipped` instead.
+ */
+const INACTIVE_BUDDY = /no active buddy|buddy is not active|未激活/iu
 
 /**
  * Check in every account, one at a time.
@@ -160,6 +208,147 @@ async function checkinOne(
       status: 'claimed',
       credit: claim.credit,
       streakDays: claim.streakDays,
+    }
+  } catch (error: unknown) {
+    return { ...base, status: 'failed', message: messageOf(error) }
+  }
+}
+
+/** Options for one travel batch run. */
+export interface WorkBuddyTravelOptions {
+  /** Report state only: never claim, never dispatch (a pure read). */
+  readOnly?: boolean
+  /** Destination id 1-4; omitted lets the server pick one at random. */
+  locationId?: number
+}
+
+/**
+ * Run the Buddy-travel closed loop on every account, one at a time.
+ *
+ * Order matters and is the whole point: **claim first, then dispatch**. A buddy
+ * that already landed holds an unclaimed reward, and dispatching from `arrived`
+ * is not allowed anyway — so claiming before deciding is what makes a single
+ * run able to both collect yesterday's trip and start today's.
+ *
+ * Nothing is lost by not running: `arrived` states persist until claimed.
+ * Never throws — every problem is a row.
+ */
+export async function travelAllAccounts(
+  targets: readonly WorkBuddyPoolTarget[],
+  deps: WorkBuddyPoolTravelDeps,
+  options: WorkBuddyTravelOptions = {},
+): Promise<WorkBuddyPoolTravelRow[]> {
+  const rows: WorkBuddyPoolTravelRow[] = []
+  let issued = 0
+  for (const target of targets) {
+    // Same politeness gap as the check-in batch: one request at a time.
+    if (issued > 0) await (deps.wait ?? defaultWait)(POOL_BATCH_GAP_MS)
+    issued += 1
+    rows.push(await travelOne(target, deps, options))
+  }
+  return rows
+}
+
+/** One account's trip through the closed loop, reduced to its row. */
+async function travelOne(
+  target: WorkBuddyPoolTarget,
+  deps: WorkBuddyPoolTravelDeps,
+  options: WorkBuddyTravelOptions,
+): Promise<WorkBuddyPoolTravelRow> {
+  const base = { accountId: target.accountId, accountName: target.accountName }
+  let credential: WorkBuddyCredential | undefined
+  try {
+    credential = await deps.credentialFor(target.accountId)
+  } catch (error: unknown) {
+    return { ...base, status: 'failed', message: messageOf(error) }
+  }
+  if (credential === undefined) {
+    return { ...base, status: 'failed', message: 'no stored credential for this account' }
+  }
+  try {
+    let status = await deps.fetchTravelStatus(credential)
+    // No travel state at all: the activity is not open for this account (the
+    // global region answers `data: {}`). Not a failure — nothing to do.
+    if (status.state === 'unknown') {
+      return { ...base, status: 'skipped', message: 'travel is not active for this account' }
+    }
+    let credit: number | undefined
+    if (status.state === 'arrived') {
+      if (options.readOnly === true) {
+        return {
+          ...base,
+          status: 'arrived',
+          ...status.rewardCredit === undefined ? {} : { credit: status.rewardCredit },
+          ...status.location === undefined ? {} : { location: status.location },
+          message: 'a reward is waiting; run again without --status to claim it',
+        }
+      }
+      const claim = await deps.claimTravelReward(credential).catch((error: unknown) => {
+        const message = messageOf(error)
+        if (INACTIVE_BUDDY.test(message)) return undefined
+        throw error
+      })
+      if (claim === undefined) {
+        return { ...base, status: 'skipped', message: 'no active buddy — 派猫猫 is not activated on this account' }
+      }
+      credit = claim.credit
+      // Re-read: claiming may leave the buddy idle (ready to depart) or still
+      // traveling, and guessing would either double-dispatch or strand it.
+      status = await deps.fetchTravelStatus(credential)
+    }
+    const carried = {
+      ...credit === undefined ? {} : { credit },
+      ...status.location === undefined ? {} : { location: status.location },
+    }
+    if (status.state === 'traveling') {
+      return {
+        ...base,
+        status: 'traveling',
+        ...carried,
+        ...status.arriveAtMs === undefined ? {} : { arriveAtMs: status.arriveAtMs },
+      }
+    }
+    if (status.state === 'arrived') {
+      // Claimed, but the server still reports a reward (a second landing).
+      // Reporting it beats claiming twice in one run.
+      return { ...base, status: 'arrived', ...carried, message: 'still reporting a reward after the claim' }
+    }
+    if (options.readOnly === true) {
+      return { ...base, status: 'idle', ...carried }
+    }
+    if (status.dailyLimitReached) {
+      return { ...base, status: 'limit', ...carried, message: "today's dispatch cap is used up" }
+    }
+    try {
+      const departure = await deps.departBuddy(credential, options.locationId)
+      return {
+        ...base,
+        status: credit === undefined ? 'departed' : 'claimed',
+        departed: true,
+        ...carried,
+        ...departure.location === undefined ? {} : { location: departure.location },
+      }
+    } catch (error: unknown) {
+      const message = messageOf(error)
+      // An account that never activated 派猫猫 answers `403 no active buddy` on
+      // the dispatch. That is account state, not a broken run — and a claim that
+      // already happened must still be reported as claimed.
+      if (INACTIVE_BUDDY.test(message)) {
+        return {
+          ...base,
+          status: credit === undefined ? 'skipped' : 'claimed',
+          ...carried,
+          message: credit === undefined
+            ? 'no active buddy — 派猫猫 is not activated on this account'
+            : 'claimed the reward; dispatch skipped (no active buddy)',
+        }
+      }
+      if (credit !== undefined) {
+        // The claim is real and irreversible; losing it from the report would
+        // hide a gain the user can see in the app.
+        return { ...base, status: 'claimed', ...carried, message: `claim succeeded, dispatch failed: ${message}` }
+      }
+      throw error
     }
   } catch (error: unknown) {
     return { ...base, status: 'failed', message: messageOf(error) }

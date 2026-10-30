@@ -1194,6 +1194,26 @@ interface WorkBuddyCheckinClaim {
   isStreakDay: boolean;
 }
 /**
+ * Buddy travel (派猫猫旅行) state.
+ *
+ * Travel is a SEPARATE activity from the credit meter: its endpoints live under
+ * `/activity/growth/buddy/travel` with no `/v2` prefix, and on the domestic
+ * region they are served by `www.workbuddy.cn` rather than the billing host the
+ * credential's `domain` names. Using the billing host there answers 404.
+ */
+interface WorkBuddyTravelStatus {
+  /** `idle` can depart, `traveling` is out, `arrived` has a reward to claim. */
+  state: 'idle' | 'traveling' | 'arrived' | 'unknown';
+  /** The server's own daily dispatch cap for this account. */
+  dailyLimitReached: boolean;
+  /** Reward waiting to be claimed, when the upstream states one. */
+  rewardCredit?: number;
+  /** Human-readable destination of the current/last trip. */
+  location?: string;
+  /** Arrival instant (epoch ms), when the upstream states one. */
+  arriveAtMs?: number;
+}
+/**
  * One promotional benefit the account may or may not still be entitled to.
  *
  * Read from the billing gateway's OWN status endpoints — the same two the
@@ -1739,6 +1759,31 @@ declare class WorkBuddyUpstreamClient {
   claimBenefit(credential: WorkBuddyCredential, kind: WorkBuddyBenefit['kind']): Promise<void>;
   /** Claim today's check-in reward. The browser route guards this mutation. */
   claimDailyCheckin(credential: WorkBuddyCredential): Promise<WorkBuddyCheckinClaim>;
+  /**
+   * Buddy travel state for one credential (read-only).
+   *
+   * `arrived` means a reward is waiting: it does not expire, so a run that only
+   * reads the state still loses nothing — the next run claims it.
+   */
+  fetchTravelStatus(credential: WorkBuddyCredential): Promise<WorkBuddyTravelStatus>;
+  /** Claim the travel reward of an `arrived` buddy. */
+  claimTravelReward(credential: WorkBuddyCredential): Promise<{
+    credit: number;
+  }>;
+  /**
+   * Dispatch the buddy (派猫猫).
+   *
+   * `location_id` is REQUIRED by the upstream: an empty body answers
+   * `400 invalid request`, so "random" is a CLIENT-side choice — four
+   * destinations with identical duration and reward ranges.
+   *
+   * The caller must have checked {@link WorkBuddyTravelStatus.dailyLimitReached}
+   * first: this is a write, and the upstream's own cap is the only thing that
+   * should stop it.
+   */
+  departBuddy(credential: WorkBuddyCredential, locationId?: number): Promise<{
+    location?: string;
+  }>;
   /**
    * The ENTERPRISE credit table (issue #124).
    *

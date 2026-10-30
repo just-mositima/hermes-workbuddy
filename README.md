@@ -35,6 +35,9 @@ hermes workbuddy status                # gateway state + autostart + live model 
 hermes workbuddy models --region cn|global
 hermes workbuddy credits [--region …]  # per-account remaining credit
 hermes workbuddy checkin [--region …] [--auto on|off|status]  # claim daily rewards
+hermes workbuddy checkin --travel [--location N]             # claim + run the 派猫猫 loop
+hermes workbuddy travel [--region …] [--status] [--location 1-4] [--auto on|off|status]
+hermes workbuddy notify [status|test]                        # push channels for the runs above
 hermes workbuddy aliases               # re-write aliases from the live catalog
 hermes workbuddy autostart [on|off]    # keep the gateway alive with Hermes (default: status)
 hermes workbuddy start|stop|restart|logs
@@ -131,6 +134,10 @@ command instead, dispatched by Hermes itself — no model turn, no tool call:
 /workbuddy status
 /workbuddy checkin [cn|global]        claim today's reward on every account (一键签到)
 /workbuddy checkin auto [on|off]      let the watchdog claim it once a day, no input
+/workbuddy checkin travel [1-4]       claim, then run the 派猫猫 travel loop
+/workbuddy travel [status] [1-4]      Buddy travel: claim a landed reward, then dispatch
+/workbuddy travel auto [on|off]       let the watchdog run that loop once a day
+/workbuddy notify [status|test]       push channels for check-in / travel runs
 /workbuddy account [cn|global] [<index>|<id>|<name>|clear]
 /workbuddy login [cn|global]          browser sign-in, URL printed in the conversation
 /workbuddy aliases                    re-read the live catalog into Hermes aliases
@@ -163,6 +170,71 @@ gateway runs on another machine (the flow is a polled login, not a loopback
 callback).
 
 `hermes workbuddy account` is the terminal twin of `/workbuddy account`.
+
+## Buddy travel (派猫猫) and push notifications
+
+Merged from the SkillHub skill
+[`totorosir-workbuddy-checkin`](https://skillhub.cn) (author totorosir), whose
+documentation maps an activity the plugin did not cover — and whose other half
+the plugin already had. What was merged, and what was deliberately skipped:
+
+| Capability in the skill | Here |
+|---|---|
+| Buddy-Station daily check-in | **skipped — duplicate.** The gateway already claims it per account (`checkin`), with the advantage that its accounts come from `login`/the desktop file and its tokens are refreshed by the gateway itself, so no web-session authorization or refresh-token export is needed |
+| 派猫猫 travel: status / claim / depart, closed loop | **merged** — native in the gateway (`travel`), so it shares the same credentials, account pool and refresh as the rest |
+| "Claim first, then dispatch" ordering | **merged** (that ordering is the whole feature: an unclaimed landing blocks the next trip) |
+| Three credential channels (local login state / web-session code / long-lived refresh token) | **skipped — duplicate.** These exist because a standalone script has no token store; the plugin is that token store. `hermes workbuddy login` + the gateway's refresh already cover "no desktop client, no re-authorization" |
+| 12-channel push + desktop toast | **partially merged** — `notify` covers webhook / DingTalk / Feishu / WeCom / Slack / Telegram / Bark / email / a local JSONL log. Paid SMS and niche QQ/PushPlus channels are **skipped**: an unattended daily job must not be able to spend money, and those channels add a dependency surface for one destination each. A headless container has no toast, so the "system" channel is the JSONL log |
+| Daily 09:00 automation via the client's own scheduler | **merged as** `travel auto on` / `checkin auto on` on the plugin's watchdog (runs while Hermes runs, no crontab, no client) |
+
+```bash
+hermes workbuddy travel --status          # 只读：状态 / 剩余奖励 / 到达倒计时
+hermes workbuddy travel                   # claim an arrived reward, then dispatch again
+hermes workbuddy travel --location 2      # 商场店铺 (1 咖啡馆 · 2 商场店铺 · 3 健身房 · 4 古镇客栈)
+hermes workbuddy travel auto on           # run that loop once a day with the watchdog
+hermes workbuddy checkin --travel         # claim the meter AND the trip in one run
+```
+
+Rows are per account per region, and the statuses are the *closed-loop* result,
+not a raw upstream field: `claimed`, `departed` (`+ → dispatched` when both
+happened), `traveling`, `limit`, `idle`, `skipped`, `failed`. Two upstream
+behaviours worth knowing, both learned the hard way:
+
+- `depart` **requires** `location_id` — an empty body answers `400 invalid
+  request`, so "random" is a client-side pick among the four equal destinations.
+- `403 no active buddy` means the account never activated 派猫猫. It is reported
+  as `skipped`, not as a rejected credential, and the travel calls classify their
+  own 403s for exactly that reason.
+
+### Push notifications
+
+```bash
+hermes workbuddy notify            # channel readiness + the config path
+hermes workbuddy notify test       # send one test message through every channel
+```
+
+`$HERMES_HOME/workbuddy/notify.json` (template written beside it as
+`notify.json.example`) is the only place credentials for push live — never the
+repo, never a skill directory:
+
+```json
+{
+  "enabled": true,
+  "success_notify": false,
+  "channels": {
+    "system": {},
+    "dingtalk": {"webhook": "https://oapi.dingtalk.com/robot/send?access_token=…", "secret": "…"},
+    "telegram": {"bot_token": "123:abc", "chat_id": "0"},
+    "webhook": {"url": "https://example.com/hook", "payload_template": "{\"text\": \"{{content}}\"}"}
+  }
+}
+```
+
+Rules that hold in code: `enabled: false` (or no file) means silence;
+success broadcasts need `success_notify: true`; failures always push when
+enabled; channels are isolated (one 500 does not stop the others and never
+changes the run's exit code); and nothing prints a URL, token or password — only
+`channel=status`.
 
 ## Switching accounts and regions
 
