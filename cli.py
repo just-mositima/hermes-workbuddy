@@ -53,6 +53,7 @@ CHECKIN_LOG = "checkin.log"
 TRAVEL_AUTO_MARKER = "travel-auto"
 TRAVEL_AUTO_ENV = "WORKBUDDY_TRAVEL_AUTO"
 TRAVEL_STAMP = "travel-stamp"
+TRAVEL_NEXT = "travel-next"
 TRAVEL_LOG = "travel.log"
 
 logger = logging.getLogger("hermes.plugins.workbuddy")
@@ -612,6 +613,7 @@ def _status_text() -> str:
     lines.append(
         f"  travel:   auto {'on' if _travel_auto_enabled() else 'off'}"
         + (f" · last run {_travel_stamp()}" if _travel_stamp() else "")
+        + _travel_due_text()
         + " · `/workbuddy travel` claims + dispatches the 派猫猫 buddy"
     )
     return "\n".join(lines)
@@ -951,6 +953,17 @@ def _travel_stamp() -> str:
     return _read_flag(TRAVEL_STAMP) or ""
 
 
+def _travel_next() -> Optional[int]:
+    """When the next auto check is due (epoch ms), or None when not waiting."""
+    raw = _read_flag(TRAVEL_NEXT)
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
 def _travel_report(
     region: str = "both", *, status_only: bool = False, location: Optional[int] = None
 ) -> tuple[dict[str, list[dict[str, Any]]], int, str]:
@@ -1056,18 +1069,40 @@ def _run_travel(
     return text, ok
 
 
+def _travel_due_text() -> str:
+    due = _travel_next()
+    if due is None:
+        return ""
+    return " · next auto check " + time.strftime("%m-%d %H:%M", time.localtime(due / 1000))
+
+
 def _travel_auto_text(mode: str = "status") -> str:
     """Arm the daily travel loop (marker file) or report it."""
     if mode in ("on", "off"):
         _write_flag(TRAVEL_AUTO_MARKER, mode)
         if mode == "on":
-            text, _ok = _run_travel("both")
-            return text + "\n\nauto: on — the watchdog runs this loop once a day from now on."
+            rows, _code, raw = _travel_report("both")
+            if not rows:
+                return (raw or "workbuddy: no travel report") + "\n\nauto: on — nothing to run yet."
+            text = _travel_card(rows)
+            ok = not any(row.get("status") == "failed" for region_rows in rows.values() for row in region_rows)
+            note = _notify_after("WorkBuddy 派猫猫", text, ok=ok)
+            _record_travel_outcome(rows)
+            if note:
+                text += "\n" + note
+            return (
+                text
+                + "\n\nauto: on — the watchdog runs this loop once a day"
+                + (" (a trip is in the air: the next check is set for just after it lands)"
+                   if _travel_next() is not None else "")
+                + _travel_due_text()
+            )
         return "auto: off — `/workbuddy travel` still runs on demand."
     return (
         f"auto: {'on' if _travel_auto_enabled() else 'off'}"
         f" · last dated run {_travel_stamp() or 'never'}"
-        f" · log {_state_dir() / TRAVEL_LOG}"
+        + _travel_due_text()
+        + f" · log {_state_dir() / TRAVEL_LOG}"
     )
 
 
@@ -1075,17 +1110,50 @@ def _auto_travel_tick() -> None:
     """Run the travel loop once per day when armed (called from the watchdog)."""
     if not _travel_auto_enabled():
         return
-    today = _today()
-    if _travel_stamp() == today:
+    due = _travel_next()
+    if due is not None and int(time.time() * 1000) < due:
+        return  # a trip is still in the air; nothing to do until it lands
+    if due is None and _travel_stamp() == _today():
         return
-    # Stamp first: a failure must not re-fire on every tick, and a dispatch is a
-    # write — one run per day is the whole contract.
-    _write_flag(TRAVEL_STAMP, today)
-    text, ok = _run_travel("both")
+    rows, _code, raw = _travel_report("both")
+    if not rows:
+        _log_travel(f"ok=False {raw}".strip())
+        return
+    text = _travel_card(rows)
+    ok = not any(row.get("status") == "failed" for region_rows in rows.values() for row in region_rows)
+    _notify_after("WorkBuddy 派猫猫", text, ok=ok)
+    _record_travel_outcome(rows)
+    _log_travel(f"ok={ok} {' '.join(text.split())}")
+
+
+def _record_travel_outcome(rows: dict[str, list[dict[str, Any]]]) -> None:
+    """Decide when the next automatic run is due, from this run's rows.
+
+    A trip in flight is the interesting case: claiming is only possible once it
+    lands, so stamping "done for today" the moment a run finds `traveling` would
+    strand the reward for the rest of the day. Instead the arrival instant is
+    remembered and the watchdog wakes up just after it — landing, claiming and
+    dispatching in one go, which is also what keeps a fresh trip going.
+    """
+    pending: Optional[int] = None
+    for region_rows in rows.values():
+        for row in region_rows:
+            arrive = row.get("arriveAtMs")
+            if row.get("status") == "traveling" and isinstance(arrive, (int, float)) and arrive > 0:
+                due = int(arrive) + 60_000
+                pending = due if pending is None else min(pending, due)
+    if pending is not None:
+        _write_flag(TRAVEL_NEXT, str(pending))
+        return
+    _write_flag(TRAVEL_NEXT, None)
+    _write_flag(TRAVEL_STAMP, _today())
+
+
+def _log_travel(line: str) -> None:
     with contextlib.suppress(OSError):
         _state_dir().mkdir(parents=True, exist_ok=True)
         with (_state_dir() / TRAVEL_LOG).open("a", encoding="utf-8") as handle:
-            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ok={ok} {' '.join(text.split())}\n")
+            handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}\n")
 
 
 
