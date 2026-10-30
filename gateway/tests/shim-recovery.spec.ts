@@ -43,6 +43,9 @@ function bodyWithTools(extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
     model: 'glm-5.3',
     messages: [{ role: 'user', content: 'hi' }],
+    // An ABSENT `stream` means a JSON answer since the fork adopted the OpenAI
+    // default, so every test that asserts on SSE frames must ask for SSE.
+    stream: true,
     tools: [{
       type: 'function',
       function: { name: 'bash', parameters: { type: 'object', required: ['command'] } },
@@ -226,6 +229,7 @@ describe('shim DSML recovery', () => {
     const declared = JSON.stringify({
       model: 'glm-5.3',
       messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
       tools: [{
         type: 'function',
         function: { name: 'pwsh', parameters: { type: 'object', required: ['command'] } },
@@ -265,7 +269,7 @@ describe('shim DSML recovery', () => {
     shim = makeShim(() => ({ ok: true, response: streamOf(chunks) }))
     await shim.ready
 
-    const body = await post(shim, JSON.stringify({ model: 'glm-5.3', messages: [] }))
+    const body = await post(shim, JSON.stringify({ model: 'glm-5.3', messages: [], stream: true }))
     expect(callsIn(body)).toEqual([])
     expect(body).toBe(chunks.join(''))
   })

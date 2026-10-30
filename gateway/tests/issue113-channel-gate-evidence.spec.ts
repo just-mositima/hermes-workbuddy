@@ -236,6 +236,9 @@ describe('the rescue ladder actually runs for the misreported body (issue #113)'
           { role: 'system', content: 'You are Cursor Agent, an AI pair programmer from Anysphere.' },
           { role: 'user', content: 'hi' },
         ],
+        // The rescued request must be an SSE answer, so ask for SSE: an absent
+        // `stream` means a JSON body since the fork adopted the OpenAI default.
+        stream: true,
       }),
     })
     const text = await response.text()

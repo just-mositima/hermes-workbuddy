@@ -83,7 +83,7 @@ function attemptsOf(): string[] {
 }
 
 /** Drive a chat completion through the shim, as the plugin's own client does. */
-async function chat(instance: WorkBuddyShim, body = '{"messages":[]}'): Promise<{ status: number, body: string }> {
+async function chat(instance: WorkBuddyShim, body = '{"messages":[],"stream":true}'): Promise<{ status: number, body: string }> {
   const response = await fetch(`${instance.baseUrl()}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${instance.token()}` },

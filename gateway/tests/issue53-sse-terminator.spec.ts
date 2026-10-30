@@ -140,6 +140,8 @@ async function post(target: WorkBuddyShim, body: string): Promise<string> {
 const BODY = JSON.stringify({
   model: 'glm-5.3',
   messages: [{ role: 'user', content: 'hi' }],
+  // SSE is what these frames are about; an absent `stream` now answers JSON.
+  stream: true,
 })
 
 describe('issue #53: frames are self-contained on the wire', () => {
