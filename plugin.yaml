@@ -1,6 +1,6 @@
 name: workbuddy
 label: WorkBuddy Models
-version: 1.4.2
+version: 1.4.3
 kind: standalone
 description: >
   Turn models from a WorkBuddy desktop sign-in (domestic codebuddy.cn or
@@ -18,11 +18,12 @@ description: >
   refreshes them against the WorkBuddy endpoints, and forwards chat
   completions; credentials never leave the machine except to WorkBuddy's own
   API. `setup` writes `providers.workbuddy`, `providers.workbuddy-global`,
-  per-model `model_aliases`, and `WORKBUDDY_GATEWAY_TOKEN` in
-  `~/.hermes/.env` (unless already set); it starts no other service and sends
-  no telemetry. Session titles Hermes generates are re-pointed at a free
-  model by default (`--session-title-model hy3`), which keeps them off the
-  paid credit line.
+  each region's live roster under the provider's `models` (with
+  `models_discovered: true`), per-model `model_aliases`, and
+  `WORKBUDDY_GATEWAY_TOKEN` in `~/.hermes/.env` (unless already set); it starts
+  no other service and sends no telemetry. Session titles Hermes generates are
+  re-pointed at a free model by default (`--session-title-model hy3`), which
+  keeps them off the paid credit line.
 
   Autostart: the plugin keeps the gateway alive alongside Hermes — it starts it
   on session start, guarantees it before any workbuddy model call, a 30s

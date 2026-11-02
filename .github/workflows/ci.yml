@@ -35,6 +35,8 @@ jobs:
           EOF
       - name: The pre-built gateway is committed
         run: test -f gateway/lib/bin.js
+      - name: Config wiring tests (providers, roster, aliases)
+        run: python -m unittest discover -s tests -v
 
   # The gateway half (Node): keep the vendored build honest.
   gateway:

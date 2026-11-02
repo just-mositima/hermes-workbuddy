@@ -59,9 +59,11 @@ Inside a conversation, the same operations are `/workbuddy …` — see
 
 `setup` writes, idempotently:
 
-- `providers.workbuddy` and `providers.workbuddy-global` (base URL + `key_env: WORKBUDDY_GATEWAY_TOKEN`)
+- `providers.workbuddy` and `providers.workbuddy-global` (base URL + `key_env: WORKBUDDY_GATEWAY_TOKEN`), plus each region's live roster under `models:` with `models_discovered: true`
 - `model_aliases.wb-<model>` / `model_aliases.wbg-<model>`, plus one short alias per region (`wb`, `wbg`) — re-written automatically as soon as a sign-in makes models reachable, since a first install wires them before any account exists
 - `WORKBUDDY_GATEWAY_TOKEN` in `~/.hermes/.env` when absent
+
+The roster is part of the provider entry on purpose: Hermes' switch-model screens read saved endpoints from its provider-models disk cache only, and it persists a discovered catalog for `custom_providers` entries but never for `providers:` rows. A provider wired with nothing but `base_url` renders as **0 models** until some other surface happens to probe `/v1/models`, even while `/model wb-…` works — so the roster is written into the config (and refreshed on `install`/`setup`, after a sign-in, and by `aliases`).
 
 The gateway runs with `--log-requests` (one JSONL line per upstream attempt in `~/.hermes/workbuddy/requests.<region>.jsonl`) and `--session-title-model hy3`, which re-points Hermes' per-session title requests at a free model — otherwise each conversation shows one extra tiny billed request on the provider's usage page.
 
@@ -253,11 +255,12 @@ Both regions run side by side. `wb-*` aliases are domestic, `wbg-*` are internat
 
 ## Troubleshooting: a provider shows 0 models
 
-`WorkBuddy CN — 0 models` (or Global) in the switch-model screen means Hermes probed `http://127.0.0.1:8787/v1/models` and got an empty list. Three causes, in order of likelihood:
+`WorkBuddy CN — 0 models` (or Global) in the switch-model screen means Hermes probed `http://127.0.0.1:8787/v1/models` and got an empty list. Four causes, in order of likelihood:
 
 1. **No sign-in for that region** — `hermes workbuddy login --region cn|global`. A region without an account deliberately advertises nothing, because a row that can only answer 401 is worse than no row.
 2. **A sign-in that landed on an already-running gateway** (the fresh-install case; fixed in plugin 1.4.2 / gateway 6.0.1). `/v1/models` now re-reads the roster on the first EMPTY answer, so the models show up on the next picker open. Before that the roster was only re-read on the periodic refresh — 30 minutes by default — which read as "the connection test passes but the picker says 0 models": a chat request resolves the account itself and succeeds while the catalog is still empty.
-3. **`WORKBUDDY_GATEWAY_TOKEN` missing or stale in `$HERMES_HOME/.env`** — the picker authenticates its probe with the provider's `key_env`, so a value that does not match `$HERMES_HOME/workbuddy/gateway-token` answers 401 and the row renders empty, while `hermes workbuddy status` (which reads the state file) looks healthy. `hermes workbuddy install` repairs the `.env` entry; compare with `cat $HERMES_HOME/workbuddy/gateway-token`.
+3. **A provider wired without a roster** (fixed in plugin 1.4.3). The switch-model screens are a cache-only read path: a `providers:` entry that carries just `base_url`/`key_env` has no catalog to show until something else probes the gateway, so the row stayed at 0 even with the gateway healthy and `/model wb-hy3` working. `_wire_config` now writes the live roster into `providers.workbuddy(.…-global).models` with `models_discovered: true`. Repair an older install with `hermes workbuddy aliases` (or re-run `install`).
+4. **`WORKBUDDY_GATEWAY_TOKEN` missing or stale in `$HERMES_HOME/.env`** — the picker authenticates its probe with the provider's `key_env`, so a value that does not match `$HERMES_HOME/workbuddy/gateway-token` answers 401 and the row renders empty, while `hermes workbuddy status` (which reads the state file) looks healthy. `hermes workbuddy install` repairs the `.env` entry; compare with `cat $HERMES_HOME/workbuddy/gateway-token`.
 
 `hermes workbuddy status` prints the live count per region and `hermes workbuddy aliases` re-writes the `wb-*` / `wbg-*` map from that catalog. Aliases are also written automatically right after a sign-in, and by the watchdog within a minute for a sign-in finished in-session, so a fresh install never needs a second command.
 

@@ -635,26 +635,35 @@ def _refresh_aliases_text() -> str:
     total = sum(len(ids) for ids in models.values())
     return (
         f"Refreshed {total} model alias(es) from the live catalog — "
-        "`/model wb-…` (domestic) and `/model wbg-…` (global) now resolve."
+        "`/model wb-…` (domestic) and `/model wbg-…` (global) now resolve, "
+        "and the switch-model rows list that same catalog."
     )
 
 
 _ALIAS_HEAL_AT = [0.0]
 
 
-def _wired_aliases() -> Optional[dict[str, Any]]:
+def _wired_config() -> Optional[dict[str, Any]]:
+    """The loaded config, or ``None`` when it cannot be read."""
+    try:
+        from hermes_cli.config import load_config
+
+        return load_config()
+    except Exception:
+        return None
+
+
+def _wired_aliases(config: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """The configured ``model_aliases`` map, or ``None`` when it cannot be read.
 
     A config that simply has no ``model_aliases:`` block yields ``{}`` — the
     fresh-install state, which the caller must treat as "nothing wired yet",
     not as "unreadable" (the distinction is what makes the self-heal fire).
     """
-    try:
-        from hermes_cli.config import load_config
-
-        aliases = load_config().get("model_aliases")
-    except Exception:
+    config = config if config is not None else _wired_config()
+    if config is None:
         return None
+    aliases = config.get("model_aliases")
     return aliases if isinstance(aliases, dict) else {}
 
 
@@ -663,6 +672,26 @@ def _has_workbuddy_alias(aliases: dict[str, Any]) -> bool:
     for key in aliases:
         name = str(key).strip().lower()
         if name in ("wb", "wbg") or name.startswith(("wb-", "wbg-")):
+            return True
+    return False
+
+
+def _provider_roster_missing(config: dict[str, Any]) -> bool:
+    """Whether one of our providers has no persisted ``models`` roster.
+
+    1.4.2 and earlier wired aliases only, so an upgraded install keeps ``/model
+    wb-…`` working while every switch-model screen still renders that provider as
+    "0 models" (those screens read the saved catalog, never the network). Treat a
+    roster-less provider as "needs wiring" so the watchdog repairs it in place.
+    """
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    for key, entry in providers.items():
+        if not str(key).startswith(WORKBUDDY_PROVIDER_PREFIX) or not isinstance(entry, dict):
+            continue
+        models = entry.get("models")
+        if not isinstance(models, dict) or not models:
             return True
     return False
 
@@ -700,20 +729,24 @@ def _post_login_wiring(region: str) -> str:
 
 
 def _aliases_selfheal() -> None:
-    """Write model aliases once a sign-in makes models reachable (watchdog tick).
+    """Wire aliases + provider rosters once models are reachable (watchdog tick).
 
-    Covers sign-ins no command can see finish: the in-session ``/workbuddy
-    login`` runs the browser flow DETACHED, so nothing is left to re-wire the
-    config when the user completes it. Cheap by design — it reads the config at
-    most once per ``ALIAS_HEAL_SECONDS`` and only asks the gateway for models
-    when NO ``wb``/``wbg`` alias exists at all, which is exactly the
-    fresh-install state.
+    Covers two states nothing else repairs on its own: a sign-in no command can
+    see finish (the in-session ``/workbuddy login`` runs the browser flow
+    DETACHED), and an install upgraded from 1.4.2 or earlier, which carries the
+    ``wb-*`` aliases but no ``models`` roster — the switch-model screens read the
+    roster, so those rows stayed at "0 models" after an upgrade. Cheap by design:
+    it reads the config at most once per ``ALIAS_HEAL_SECONDS`` and asks the
+    gateway for models only when a region is missing aliases or a roster.
     """
     if time.monotonic() - _ALIAS_HEAL_AT[0] < ALIAS_HEAL_SECONDS:
         return
     _ALIAS_HEAL_AT[0] = time.monotonic()
-    aliases = _wired_aliases()
-    if aliases is None or _has_workbuddy_alias(aliases):
+    config = _wired_config()
+    if config is None:
+        return
+    aliases = _wired_aliases(config)
+    if aliases is not None and _has_workbuddy_alias(aliases) and not _provider_roster_missing(config):
         return
     try:
         token = _read_token()
@@ -725,7 +758,7 @@ def _aliases_selfheal() -> None:
             return
         _wire_config(regions, models)
         logger.info(
-            "workbuddy: aliases wired after sign-in (%s)",
+            "workbuddy: aliases + provider rosters wired (%s)",
             ", ".join(f"{name}:{len(ids)}" for name, ids in sorted(models.items())),
         )
     except Exception:
@@ -1327,37 +1360,83 @@ def _write_env_token(token: str) -> bool:
     return True
 
 
+def _provider_key(region: str) -> str:
+    """``providers:`` key for a region (``workbuddy`` / ``workbuddy-global``)."""
+    return "workbuddy" if region == "cn" else f"workbuddy-{region}"
+
+
+def _region_alias_keys(region: str, aliases: dict[str, Any]) -> list[str]:
+    """Alias keys this plugin owns for *region* (``wb``/``wb-*``, ``wbg``/``wbg-*``)."""
+    prefix = ALIAS_PREFIX.get(region, f"wb-{region}")
+    return [key for key in aliases if str(key) == prefix or str(key).startswith(f"{prefix}-")]
+
+
 def _wire_config(regions: dict[str, dict[str, Any]], models: dict[str, list[str]]) -> None:
-    """Write ``providers.*`` and per-model ``model_aliases`` (idempotent)."""
+    """Write ``providers.*`` (with the live roster) and per-model ``model_aliases``.
+
+    The roster is persisted under ``models`` — not just as aliases — because the model
+    switchers (in-session ``/model``, desktop ``model.options``) read saved endpoints
+    from the provider-models disk cache only, and Hermes persists a discovered catalog
+    for ``custom_providers`` entries but never for ``providers:`` rows. A provider wired
+    with nothing but ``base_url`` therefore renders as **0 models** in the picker until
+    some other surface happens to probe ``/v1/models`` — while ``/model wb-…`` keeps
+    working, which is why a connectivity test passing and an empty picker happen
+    together. ``models_discovered: true`` marks the mapping as Hermes' own catalog
+    rather than a user allowlist, so it never narrows what can be selected.
+
+    A region whose roster comes back empty (no sign-in yet, upstream hiccup) keeps the
+    models and aliases already wired instead of blanking that row.
+    """
     from hermes_cli.config import load_config, save_config
 
-    providers: dict[str, Any] = {}
-    aliases: dict[str, Any] = {}
+    config = load_config()
+    providers = dict(config.get("providers") or {})
+    existing = config.get("model_aliases") if isinstance(config.get("model_aliases"), dict) else {}
+    aliases = {k: v for k, v in existing.items() if isinstance(v, dict) and "model" in v}
+
     for region, info in regions.items():
-        provider_key = "workbuddy" if region == "cn" else f"workbuddy-{region}"
-        providers[provider_key] = {
+        provider_key = _provider_key(region)
+        previous = providers.get(provider_key)
+        previous = previous if isinstance(previous, dict) else {}
+        prev_models = previous.get("models") if isinstance(previous.get("models"), dict) else {}
+        ids = [str(model_id) for model_id in (models.get(region) or []) if model_id]
+        entry: dict[str, Any] = {
             "name": "WorkBuddy CN" if region == "cn" else f"WorkBuddy {region.title()}",
             "base_url": info["baseUrl"],
             "key_env": TOKEN_ENV,
         }
-        ids = models.get(region) or []
+        if not ids:
+            if prev_models:
+                entry["models"] = prev_models
+                if previous.get("models_discovered") is True:
+                    entry["models_discovered"] = True
+            providers[provider_key] = entry
+            continue
+
+        # Keep any per-model metadata already on disk for ids that survive the refresh.
+        entry["models"] = {
+            model_id: meta if isinstance((meta := prev_models.get(model_id)), dict) else {}
+            for model_id in ids
+        }
+        entry["models_discovered"] = True
+        providers[provider_key] = entry
+
         prefix = ALIAS_PREFIX.get(region, f"wb-{region}")
+        for stale in _region_alias_keys(region, aliases):
+            del aliases[stale]
         for model_id in ids:
             aliases[f"{prefix}-{model_id}"] = {"model": model_id, "provider": provider_key}
-        if ids:
-            # One short alias per region for the quick switch; the free model
-            # when the roster has one, else the cheapest-looking first entry.
-            quick = next((m for m in ids if m in ("deepseek-v4.1-flash", "hy3")), ids[0])
-            aliases[prefix] = {"model": quick, "provider": provider_key}
+        # One short alias per region for the quick switch; the free model
+        # when the roster has one, else the cheapest-looking first entry.
+        quick = next((m for m in ids if m in ("deepseek-v4.1-flash", "hy3")), ids[0])
+        aliases[prefix] = {"model": quick, "provider": provider_key}
 
-    current = load_config()
-    existing = current.get("model_aliases") if isinstance(current.get("model_aliases"), dict) else {}
-    merged_aliases = {k: v for k, v in existing.items() if isinstance(v, dict) and "model" in v}
-    merged_aliases.update(aliases)
-    save_config(
-        {"providers": providers, "model_aliases": merged_aliases},
-        merge_existing=True,
-    )
+    config["providers"] = providers
+    config["model_aliases"] = aliases
+    # Full-config write so a retired model id leaves ``models`` with the roster instead
+    # of lingering under a deep merge (save_config(..., merge_existing=True) keeps keys
+    # the caller omitted, which would make the picker's count drift above the truth).
+    save_config(config)
 
 
 # ── Subcommands ───────────────────────────────────────────────────────
