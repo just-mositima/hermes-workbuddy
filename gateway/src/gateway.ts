@@ -455,6 +455,10 @@ export async function runGateway(options: ServeOptions): Promise<void> {
       logger,
       port: options.ports[region],
       token,
+      // An empty `/v1/models` re-reads the roster on the spot: a sign-in that
+      // lands while this process is already serving must not wait for the next
+      // periodic refresh (see `healEmptyCatalog`).
+      onModelsEmpty: () => healEmptyCatalog(region),
       channelPerturbation: options.channelPerturbation,
       keepPromptLast: options.keepPromptLast,
       ...options.sessionTitleModel === undefined ? {} : {
@@ -568,12 +572,70 @@ export async function runGateway(options: ServeOptions): Promise<void> {
     logger.warn(`${stack.region}: catalog refreshed — ${stack.modelIds.length} model(s)`)
   }
 
-  const refreshAll = (): void => {
-    for (const stack of stacks.values()) {
-      void refreshCatalog(stack)
-        .then(() => writeStateFile())
-        .catch(error => logger.warn(`${stack.region}: catalog refresh failed; serving the static fallback`, error))
+  /**
+   * One in-flight refresh per region, plus when a HEAL last ran.
+   *
+   * `/v1/models` can ask for a refresh at any moment (see `onModelsEmpty`), and
+   * a picker may probe repeatedly — the map keeps that from turning into one
+   * upstream roster call per probe, and the timestamp keeps a legitimately empty
+   * catalog (a user who disabled every model) from re-fetching on every open.
+   * Only heal-triggered refreshes stamp it: the periodic refresh says nothing
+   * about whether a NEW sign-in has arrived since.
+   */
+  const refreshInFlight = new Map<WorkBuddyRegion, Promise<void>>()
+  const lastHealAt = new Map<WorkBuddyRegion, number>()
+  const EMPTY_CATALOG_RETRY_MS = 10_000
+
+  /**
+   * Refresh one region, deduped: a concurrent caller joins the running call
+   * instead of starting a second upstream round trip.
+   */
+  const refreshRegion = (stack: RegionStack): Promise<void> => {
+    const running = refreshInFlight.get(stack.region)
+    if (running !== undefined) return running
+    const mine = refreshCatalog(stack)
+      .then(() => writeStateFile())
+      .catch(error => logger.warn(`${stack.region}: catalog refresh failed; serving the static fallback`, error))
+      .finally(() => refreshInFlight.delete(stack.region))
+    refreshInFlight.set(stack.region, mine)
+    return mine
+  }
+
+  /**
+   * Self-heal an empty catalog on demand.
+   *
+   * WHY (measured 2026-11-02): the sign-in gate is evaluated at startup and on
+   * the periodic refresh only, so an account that arrives while the gateway is
+   * already running stayed invisible to `/v1/models` for up to a full refresh
+   * period (30 min). A consumer that discovers models by probing that route —
+   * Hermes' picker — therefore showed the region as "0 models" immediately
+   * after a successful fresh-install login. Re-reading on the empty answer
+   * closes that window to one probe.
+   */
+  async function healEmptyCatalog(region: WorkBuddyRegion): Promise<void> {
+    const stack = stacks.get(region)
+    if (stack === undefined) return
+    // Cheap gate FIRST: a refresh can only change the answer when a sign-in
+    // exists, and the account scan is shared across concurrent reads (1s
+    // window), so a signed-out region costs one directory read — never an
+    // upstream round trip, and never a cooldown that hides a sign-in landing
+    // seconds later.
+    const accounts = await stack.store.accounts().catch(() => [])
+    if (accounts.length === 0) return
+    // Join a refresh already in flight (a burst of probes must not multiply
+    // upstream calls); otherwise respect the cooldown, which exists only for the
+    // case a refresh cannot fix — every model switched off by the user.
+    if (refreshInFlight.has(region)) {
+      await refreshRegion(stack)
+      return
     }
+    if (Date.now() - (lastHealAt.get(region) ?? 0) < EMPTY_CATALOG_RETRY_MS) return
+    lastHealAt.set(region, Date.now())
+    await refreshRegion(stack)
+  }
+
+  const refreshAll = (): void => {
+    for (const stack of stacks.values()) void refreshRegion(stack)
   }
 
   // The sign-in gate lands BEFORE ready (see resolveUsable); the live roster

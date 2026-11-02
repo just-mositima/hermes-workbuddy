@@ -10271,12 +10271,35 @@ async function listenOnClientReachablePort(options) {
 	}
 }
 /**
+* How long `/v1/models` waits for an on-demand catalog refresh.
+*
+* Hermes' pickers probe a custom endpoint with a 1.5s budget (5s for an
+* explicit refresh), so this has to stay under the tighter one. The upstream
+* roster call usually answers in a few hundred ms; a refresh that misses the
+* window still lands for the NEXT probe, because the owner's promise is not
+* cancelled by this timer.
+*/
+const MODELS_REFRESH_WAIT_MS = 1200;
+/** Await `task` for at most {@link MODELS_REFRESH_WAIT_MS}; never rejects. */
+async function waitForModelsRefresh(task) {
+	let timer;
+	try {
+		await Promise.race([Promise.resolve().then(task).catch(() => {}), new Promise((resolve) => {
+			timer = setTimeout(resolve, MODELS_REFRESH_WAIT_MS);
+			timer.unref?.();
+		})]);
+	} finally {
+		if (timer !== void 0) clearTimeout(timer);
+	}
+}
+/**
 * Start the loopback endpoint. Requests must carry the shim's shared secret;
 * the loopback bind alone is not a trust boundary.
 */
 function createWorkBuddyShim(options) {
 	const { store, client, catalog } = options;
 	const logger = options.logger;
+	const onModelsEmpty = options.onModelsEmpty;
 	const failoverAccount = options.failoverAccount;
 	const failoverShortfall = options.failoverShortfall;
 	const reportRefusedTier = options.reportRefusal ?? (() => {});
@@ -10398,6 +10421,7 @@ function createWorkBuddyShim(options) {
 				return;
 			}
 			if (req.method === "GET" && (url === "/v1/models" || url === "/v1/models/")) {
+				if (catalog.current().length === 0 && onModelsEmpty !== void 0) await waitForModelsRefresh(onModelsEmpty);
 				writeJson(res, 200, {
 					object: "list",
 					data: catalog.current().map((model) => ({

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { $t as WORKBUDDY_APP_EXECUTABLE_ENV, A as outcomeOfFailure, C as travelAllAccounts, F as redactUpstreamText, H as FALLBACK_WORKBUDDY_MODELS, K as deriveCatalog, L as createWorkBuddyShim, O as cooldownOf, Q as WorkBuddyCredentialStore, U as FALLBACK_WORKBUDDY_MODELS_GLOBAL, V as piAiRuntimeInfo, W as WorkBuddyCatalog, Z as WORKBUDDY_AUTH_FILE_ENV, a as readHostHeartbeat, an as findWorkbuddyAppExecutableWithSource, b as checkinAllAccounts, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, dt as workbuddyOwnAuthPath, f as readPoolProbes, h as oauthStart, ht as WorkBuddyUpstreamClient, m as oauthPoll, mn as writeFileAtomic, nt as defaultDesktopAuthDirs, o as workbuddyHostHeartbeatPath, p as writePoolProbes, pn as hostPeersInfo, q as fallbackModelsFor, r as isHeartbeatProcessAlive, st as legacyWorkbuddyOwnAuthPath, tt as defaultDesktopAuthCandidates, u as describeRosterSeenPayload, v as rankPool, yt as modelIdOfBody } from "./host-heartbeat-DUEu7bdr.js";
+import { $t as WORKBUDDY_APP_EXECUTABLE_ENV, A as outcomeOfFailure, C as travelAllAccounts, F as redactUpstreamText, H as FALLBACK_WORKBUDDY_MODELS, K as deriveCatalog, L as createWorkBuddyShim, O as cooldownOf, Q as WorkBuddyCredentialStore, U as FALLBACK_WORKBUDDY_MODELS_GLOBAL, V as piAiRuntimeInfo, W as WorkBuddyCatalog, Z as WORKBUDDY_AUTH_FILE_ENV, a as readHostHeartbeat, an as findWorkbuddyAppExecutableWithSource, b as checkinAllAccounts, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, dt as workbuddyOwnAuthPath, f as readPoolProbes, h as oauthStart, ht as WorkBuddyUpstreamClient, m as oauthPoll, mn as writeFileAtomic, nt as defaultDesktopAuthDirs, o as workbuddyHostHeartbeatPath, p as writePoolProbes, pn as hostPeersInfo, q as fallbackModelsFor, r as isHeartbeatProcessAlive, st as legacyWorkbuddyOwnAuthPath, tt as defaultDesktopAuthCandidates, u as describeRosterSeenPayload, v as rankPool, yt as modelIdOfBody } from "./host-heartbeat-DDmRVWg-.js";
 import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -331,6 +331,7 @@ async function runGateway(options) {
 			logger,
 			port: options.ports[region],
 			token,
+			onModelsEmpty: () => healEmptyCatalog(region),
 			channelPerturbation: options.channelPerturbation,
 			keepPromptLast: options.keepPromptLast,
 			...options.sessionTitleModel === void 0 ? {} : { sessionTitle: {
@@ -442,8 +443,55 @@ async function runGateway(options) {
 		stack.modelIds = stack.catalog.current().map((model) => model.id);
 		logger.warn(`${stack.region}: catalog refreshed — ${stack.modelIds.length} model(s)`);
 	};
+	/**
+	* One in-flight refresh per region, plus when a HEAL last ran.
+	*
+	* `/v1/models` can ask for a refresh at any moment (see `onModelsEmpty`), and
+	* a picker may probe repeatedly — the map keeps that from turning into one
+	* upstream roster call per probe, and the timestamp keeps a legitimately empty
+	* catalog (a user who disabled every model) from re-fetching on every open.
+	* Only heal-triggered refreshes stamp it: the periodic refresh says nothing
+	* about whether a NEW sign-in has arrived since.
+	*/
+	const refreshInFlight = /* @__PURE__ */ new Map();
+	const lastHealAt = /* @__PURE__ */ new Map();
+	const EMPTY_CATALOG_RETRY_MS = 1e4;
+	/**
+	* Refresh one region, deduped: a concurrent caller joins the running call
+	* instead of starting a second upstream round trip.
+	*/
+	const refreshRegion = (stack) => {
+		const running = refreshInFlight.get(stack.region);
+		if (running !== void 0) return running;
+		const mine = refreshCatalog(stack).then(() => writeStateFile()).catch((error) => logger.warn(`${stack.region}: catalog refresh failed; serving the static fallback`, error)).finally(() => refreshInFlight.delete(stack.region));
+		refreshInFlight.set(stack.region, mine);
+		return mine;
+	};
+	/**
+	* Self-heal an empty catalog on demand.
+	*
+	* WHY (measured 2026-11-02): the sign-in gate is evaluated at startup and on
+	* the periodic refresh only, so an account that arrives while the gateway is
+	* already running stayed invisible to `/v1/models` for up to a full refresh
+	* period (30 min). A consumer that discovers models by probing that route —
+	* Hermes' picker — therefore showed the region as "0 models" immediately
+	* after a successful fresh-install login. Re-reading on the empty answer
+	* closes that window to one probe.
+	*/
+	async function healEmptyCatalog(region) {
+		const stack = stacks.get(region);
+		if (stack === void 0) return;
+		if ((await stack.store.accounts().catch(() => [])).length === 0) return;
+		if (refreshInFlight.has(region)) {
+			await refreshRegion(stack);
+			return;
+		}
+		if (Date.now() - (lastHealAt.get(region) ?? 0) < EMPTY_CATALOG_RETRY_MS) return;
+		lastHealAt.set(region, Date.now());
+		await refreshRegion(stack);
+	}
 	const refreshAll = () => {
-		for (const stack of stacks.values()) refreshCatalog(stack).then(() => writeStateFile()).catch((error) => logger.warn(`${stack.region}: catalog refresh failed; serving the static fallback`, error));
+		for (const stack of stacks.values()) refreshRegion(stack);
 	};
 	await Promise.all([...stacks.values()].map((stack) => resolveUsable(stack)));
 	refreshAll();

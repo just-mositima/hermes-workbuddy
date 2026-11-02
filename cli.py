@@ -55,6 +55,11 @@ TRAVEL_AUTO_ENV = "WORKBUDDY_TRAVEL_AUTO"
 TRAVEL_STAMP = "travel-stamp"
 TRAVEL_NEXT = "travel-next"
 TRAVEL_LOG = "travel.log"
+# Model aliases: `_wire_config` writes one flat alias per live model (wb-* for CN,
+# wbg-* for global) plus the region's short alias. A FIRST install has no account
+# yet, so that map comes out empty; the watchdog re-wires it once models become
+# reachable (see `_aliases_selfheal`).
+ALIAS_HEAL_SECONDS = 60.0
 
 logger = logging.getLogger("hermes.plugins.workbuddy")
 
@@ -419,6 +424,7 @@ def _watchdog_loop() -> None:
                 continue
             if not _is_running():
                 _ensure_running(quiet=True)
+            _aliases_selfheal()
             _auto_checkin_tick()
             _auto_travel_tick()
         except Exception:
@@ -631,6 +637,99 @@ def _refresh_aliases_text() -> str:
         f"Refreshed {total} model alias(es) from the live catalog — "
         "`/model wb-…` (domestic) and `/model wbg-…` (global) now resolve."
     )
+
+
+_ALIAS_HEAL_AT = [0.0]
+
+
+def _wired_aliases() -> Optional[dict[str, Any]]:
+    """The configured ``model_aliases`` map, or ``None`` when it cannot be read.
+
+    A config that simply has no ``model_aliases:`` block yields ``{}`` — the
+    fresh-install state, which the caller must treat as "nothing wired yet",
+    not as "unreadable" (the distinction is what makes the self-heal fire).
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        aliases = load_config().get("model_aliases")
+    except Exception:
+        return None
+    return aliases if isinstance(aliases, dict) else {}
+
+
+def _has_workbuddy_alias(aliases: dict[str, Any]) -> bool:
+    """Whether the config carries at least one of OUR aliases (``wb``/``wb-*``/``wbg…``)."""
+    for key in aliases:
+        name = str(key).strip().lower()
+        if name in ("wb", "wbg") or name.startswith(("wb-", "wbg-")):
+            return True
+    return False
+
+
+def _post_login_wiring(region: str) -> str:
+    """Wire this region's model aliases the moment a sign-in lands.
+
+    A FIRST install wires the providers BEFORE any account exists, so the alias
+    map comes out empty and a later sign-in used to leave ``/model wb-*`` (and
+    the region's short alias) missing until someone ran ``hermes workbuddy
+    aliases`` by hand. The gateway re-reads its roster on the first empty
+    ``/v1/models`` probe, so this read is live right after the login returns.
+    """
+    try:
+        token = _read_token()
+        regions = _regions_from_state(_read_state())
+        if not token or not regions:
+            return ""
+        models = {name: _fetch_models(info["baseUrl"], token) for name, info in regions.items()}
+        if not any(models.values()):
+            return (
+                "workbuddy: no models reachable yet — run `hermes workbuddy aliases` "
+                "once the gateway has re-read its catalog."
+            )
+        _wire_config(regions, models)
+    except Exception:
+        logger.debug("workbuddy: post-login alias wiring failed", exc_info=True)
+        return ""
+    count = len(models.get(region) or [])
+    prefix = ALIAS_PREFIX.get(region, f"wb-{region}")
+    return (
+        f"workbuddy: {count} model(s) wired as `{prefix}-*` — "
+        f"switch with `/model {prefix}-<model>` (or `/model {prefix}`)."
+    )
+
+
+def _aliases_selfheal() -> None:
+    """Write model aliases once a sign-in makes models reachable (watchdog tick).
+
+    Covers sign-ins no command can see finish: the in-session ``/workbuddy
+    login`` runs the browser flow DETACHED, so nothing is left to re-wire the
+    config when the user completes it. Cheap by design — it reads the config at
+    most once per ``ALIAS_HEAL_SECONDS`` and only asks the gateway for models
+    when NO ``wb``/``wbg`` alias exists at all, which is exactly the
+    fresh-install state.
+    """
+    if time.monotonic() - _ALIAS_HEAL_AT[0] < ALIAS_HEAL_SECONDS:
+        return
+    _ALIAS_HEAL_AT[0] = time.monotonic()
+    aliases = _wired_aliases()
+    if aliases is None or _has_workbuddy_alias(aliases):
+        return
+    try:
+        token = _read_token()
+        regions = _regions_from_state(_read_state())
+        if not token or not regions:
+            return
+        models = {name: _fetch_models(info["baseUrl"], token) for name, info in regions.items()}
+        if not any(models.values()):
+            return
+        _wire_config(regions, models)
+        logger.info(
+            "workbuddy: aliases wired after sign-in (%s)",
+            ", ".join(f"{name}:{len(ids)}" for name, ids in sorted(models.items())),
+        )
+    except Exception:
+        logger.warning("workbuddy: alias self-heal failed", exc_info=True)
 
 
 def _login(region: str) -> str:
@@ -1289,7 +1388,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "\nworkbuddy: no models yet — sign in first:\n"
             "  hermes workbuddy login --region cn        (domestic)\n"
             "  hermes workbuddy login --region global    (international)\n"
-            "then re-run `hermes workbuddy setup` (or `hermes workbuddy aliases`)."
+            "The model aliases are written automatically once the sign-in lands\n"
+            "(`hermes workbuddy aliases` forces it, `/workbuddy aliases` in-session)."
         )
     else:
         print("\nSwitch models in-session: /model wb-<model> or /model wbg-<model>")
@@ -1310,7 +1410,14 @@ def _cmd_login(args: argparse.Namespace) -> int:
         print("workbuddy: gateway not running — starting it first", file=sys.stderr)
         if _start() != 0:
             return 1
-    return _run_gateway(["login", "--region", region]).returncode
+    code = _run_gateway(["login", "--region", region]).returncode
+    if code == 0:
+        # The sign-in is the moment models become real: write the aliases now so
+        # the picker and `/model wb-*` work without a second command.
+        wiring = _post_login_wiring(region)
+        if wiring:
+            print(wiring)
+    return code
 
 
 def _cmd_start(args: argparse.Namespace) -> int:

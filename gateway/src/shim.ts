@@ -134,6 +134,23 @@ export interface WorkBuddyShimOptions {
    */
   token?: string
   /**
+   * Re-read the live catalog when `/v1/models` is about to answer with NOTHING.
+   *
+   * WHY THIS EXISTS (measured 2026-11-02, fresh install). A consumer discovers
+   * models by probing this route — Hermes' model picker does exactly that. A
+   * region with no sign-in is gated to an empty list (never the static fallback),
+   * and the roster is re-read only on the periodic refresh — 30 minutes by
+   * default. So a sign-in that lands on an ALREADY-RUNNING gateway stayed
+   * invisible to the picker until the next tick: the user signed in, every test
+   * passed, and the switch-model screen listed "WorkBuddy CN — 0 models".
+   *
+   * The owner decides whether a refresh is warranted (accounts present, cooldown
+   * elapsed); the shim only waits a bounded moment for it so a probe never
+   * outlives a picker's budget. Absent keeps the original behaviour (a static
+   * catalog and nothing else).
+   */
+  onModelsEmpty?: () => Promise<void> | void
+  /**
    * When to perturb scanned messages with invisible characters.
    *
    * `off` keeps the ordinary fail-then-rescue ladder; `failure` (the default)
@@ -1416,12 +1433,40 @@ export async function listenOnClientReachablePort(options: {
 }
 
 /**
+ * How long `/v1/models` waits for an on-demand catalog refresh.
+ *
+ * Hermes' pickers probe a custom endpoint with a 1.5s budget (5s for an
+ * explicit refresh), so this has to stay under the tighter one. The upstream
+ * roster call usually answers in a few hundred ms; a refresh that misses the
+ * window still lands for the NEXT probe, because the owner's promise is not
+ * cancelled by this timer.
+ */
+const MODELS_REFRESH_WAIT_MS = 1_200
+
+/** Await `task` for at most {@link MODELS_REFRESH_WAIT_MS}; never rejects. */
+async function waitForModelsRefresh(task: () => Promise<void> | void): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      Promise.resolve().then(task).catch(() => {}),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, MODELS_REFRESH_WAIT_MS)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
  * Start the loopback endpoint. Requests must carry the shim's shared secret;
  * the loopback bind alone is not a trust boundary.
  */
 export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim {
   const { store, client, catalog } = options
   const logger = options.logger
+  const onModelsEmpty = options.onModelsEmpty
   const failoverAccount = options.failoverAccount
   const failoverShortfall = options.failoverShortfall
   const reportRefusedTier = options.reportRefusal ?? (() => {})
@@ -1580,6 +1625,14 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         return
       }
       if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) {
+        // An EMPTY list is the one answer worth a second look: it is how a
+        // signed-out region looks, and how a region whose sign-in arrived while
+        // this process was already serving looks too. Ask the owner to re-read
+        // the roster, but never let that wait outlast a picker's probe budget —
+        // the refresh keeps running after this answer either way.
+        if (catalog.current().length === 0 && onModelsEmpty !== undefined) {
+          await waitForModelsRefresh(onModelsEmpty)
+        }
         writeJson(res, 200, {
           object: 'list',
           data: catalog.current().map(model => ({

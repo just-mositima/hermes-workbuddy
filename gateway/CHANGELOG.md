@@ -1,5 +1,24 @@
 # Changelog
 
+## 6.0.1 (2026-11-02)
+
+### Fixes
+- **全新安装后「测试通过但 Switch model 显示 0 模型」。** 区域的登录门（无本地登录即
+  空目录）只在启动与 30 分钟周期刷新时求值，因此**已运行**的网关上完成登录后，
+  `/v1/models` 最长 30 分钟仍是空列表；Hermes 的模型选择器正是探测该路由来发现模型，
+  而行内聊天测试会自己解析凭据并通过（所以「测试通过 / 0 模型」同时出现）。
+  现在 `/v1/models` 在**结果为空**时按需重读一次上游目录（`onModelsEmpty` +
+  `healEmptyCatalog`）：先做一次账号扫描（无登录直接返回，不产生上游调用），有登录
+  才刷新，刷新在途时复用同一个 Promise，并对「刷新也无法变好」的情形（用户关掉全部
+  模型）保留 10s 冷却。探测等待上限 1.2s，不会超出选择器的预算。
+- 插件侧：登录成功后立即写入 `wb-*`/`wbg-*` 别名（`_post_login_wiring`），并且 watchdog
+  每分钟自愈一次（`_aliases_selfheal`，只在配置里**完全没有** workbuddy 别名时才发请求），
+  覆盖在会话内完成、跑在脱离进程里的 `/workbuddy login`。
+
+### Docs
+- README 新增「Troubleshooting: a provider shows 0 models」：三种成因（该区域无登录 /
+  登录落在已运行的网关上 / `.env` 里的 `WORKBUDDY_GATEWAY_TOKEN` 缺失或过期）。
+
 ## 6.0.0 (2026-10-28)
 
 > 本仓库自此是 **hermes-workbuddy**：把 dsh-connect-workbuddy 的宿主无关核心

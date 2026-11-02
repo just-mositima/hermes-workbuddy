@@ -2140,6 +2140,23 @@ interface WorkBuddyShimOptions {
    */
   token?: string;
   /**
+   * Re-read the live catalog when `/v1/models` is about to answer with NOTHING.
+   *
+   * WHY THIS EXISTS (measured 2026-11-02, fresh install). A consumer discovers
+   * models by probing this route — Hermes' model picker does exactly that. A
+   * region with no sign-in is gated to an empty list (never the static fallback),
+   * and the roster is re-read only on the periodic refresh — 30 minutes by
+   * default. So a sign-in that lands on an ALREADY-RUNNING gateway stayed
+   * invisible to the picker until the next tick: the user signed in, every test
+   * passed, and the switch-model screen listed "WorkBuddy CN — 0 models".
+   *
+   * The owner decides whether a refresh is warranted (accounts present, cooldown
+   * elapsed); the shim only waits a bounded moment for it so a probe never
+   * outlives a picker's budget. Absent keeps the original behaviour (a static
+   * catalog and nothing else).
+   */
+  onModelsEmpty?: () => Promise<void> | void;
+  /**
    * When to perturb scanned messages with invisible characters.
    *
    * `off` keeps the ordinary fail-then-rescue ladder; `failure` (the default)
