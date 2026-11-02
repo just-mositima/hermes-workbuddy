@@ -869,7 +869,18 @@ def _checkin_text(region: str = "both") -> str:
     rows, code, raw = _checkin_report(region)
     if not rows:
         return raw or "workbuddy: no check-in report"
-    return _checkin_card(rows, code)
+    return _checkin_card(rows, code) + _credits_suffix(region)
+
+
+def _credits_suffix(region: str = "both") -> str:
+    """Per-account credit balance, appended to every check-in report (user request)."""
+    _code, out, _err = _gateway_capture("credits", "--region", region, timeout=60)
+    body = (out or "").strip()
+    if not body:
+        return ""
+    lines = ["", "积分 · 各账号剩余额度"]
+    lines += [f"  {line.strip()}" for line in body.splitlines() if line.strip()]
+    return "\n".join(lines)
 
 
 def _run_checkin(
@@ -883,7 +894,7 @@ def _run_checkin(
     rows, code, raw = _checkin_report(region)
     if not rows:
         return raw or "workbuddy: no check-in report"
-    text = _checkin_card(rows, code)
+    text = _checkin_card(rows, code) + _credits_suffix(region)
     ok = not any(row.get("status") == "failed" for region_rows in rows.values() for row in region_rows)
     if announce:
         note = _notify_after("WorkBuddy 签到", text, ok=ok)
