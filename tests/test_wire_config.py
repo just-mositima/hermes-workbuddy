@@ -154,7 +154,9 @@ class WireConfigTest(unittest.TestCase):
         state = {"regions": {"cn": {"baseUrl": "http://127.0.0.1:8787/v1"},
                              "global": {"baseUrl": "http://127.0.0.1:8788/v1"}}}
         originals = (cli._read_token, cli._read_state, cli._fetch_models, cli._ALIAS_HEAL_AT[0])
-        cli._ALIAS_HEAL_AT[0] = 0.0
+        # Negative, not 0.0: the guard is ``monotonic() - last < ALIAS_HEAL_SECONDS``, and a
+        # freshly booted CI runner can have an uptime below that window.
+        cli._ALIAS_HEAL_AT[0] = -1e9
         cli._read_token = lambda: "token"  # type: ignore[assignment]
         cli._read_state = lambda: state  # type: ignore[assignment]
         cli._fetch_models = (  # type: ignore[assignment]
