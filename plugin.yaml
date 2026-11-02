@@ -1,6 +1,6 @@
 name: workbuddy
 label: WorkBuddy Models
-version: 1.4.3
+version: 1.4.4
 kind: standalone
 description: >
   Turn models from a WorkBuddy desktop sign-in (domestic codebuddy.cn or

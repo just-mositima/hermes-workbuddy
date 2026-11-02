@@ -38,6 +38,12 @@ TOKEN_ENV = "WORKBUDDY_GATEWAY_TOKEN"
 AUTOSTART_ENV = "WORKBUDDY_AUTOSTART"
 AUTOSTART_MARKER = "autostart"
 AUTOSTART_HOOK_NAME = "workbuddy-autostart"
+# Account pool: `gateway serve` enables pool rotation by DEFAULT, and rotation
+# outranks the user's selection on every request (prepareAccount ranks the
+# local accounts by credits and overrides the pick), so `account --region cn <id>`
+# looks applied while a different account is billed. The gateway is therefore
+# started with `--no-pool` unless WORKBUDDY_POOL turns rotation back on.
+POOL_ENV = "WORKBUDDY_POOL"
 STOP_MARKER = "stopped"
 WATCHDOG_SECONDS = 30.0
 WORKBUDDY_PROVIDER_PREFIX = "workbuddy"
@@ -298,6 +304,20 @@ def _ensure_running(*, quiet: bool = True, respect_stop: bool = True, port: Opti
         return _start(port=port or DEFAULT_PORTS["cn"], quiet=quiet) == 0
 
 
+def _pool_args() -> list[str]:
+    """`serve` flags that decide whether account rotation may override the pick.
+
+    Pool rotation is OFF by default (see POOL_ENV): the account selected with
+    `account --region <r> <id>` — or, with no selection, the newest sign-in — is
+    the one that gets billed. `WORKBUDDY_POOL=1` restores the gateway's own
+    default (rank every local account by remaining credit, rotate/fail over).
+    """
+    raw = (os.environ.get(POOL_ENV) or "").strip().lower()
+    if raw in {"1", "on", "true", "yes"}:
+        return []
+    return ["--no-pool"]
+
+
 def _start(*, port: int = DEFAULT_PORTS["cn"], quiet: bool = False) -> int:
     _write_flag(STOP_MARKER, None)  # an explicit start overrides `stop`
     if _is_running():
@@ -312,6 +332,7 @@ def _start(*, port: int = DEFAULT_PORTS["cn"], quiet: bool = False) -> int:
             "--log-requests",
             "--session-title-model", DEFAULT_TITLE_MODEL,
             "--port", str(port),
+            *_pool_args(),
         ],
         cwd=str(_gateway_dir()),
         env=_node_env(),

@@ -253,6 +253,8 @@ changes the run's exit code); and nothing prints a URL, token or password — on
 
 Both regions run side by side. `wb-*` aliases are domestic, `wbg-*` are international; each region keeps its own credentials, catalog and account pool. With several signed-in accounts per region the gateway fails over and benches an account for the cooldown the upstream itself states. `/workbuddy account` picks the account that pays; `--clear` goes back to "newest sign-in".
 
+Account rotation is **off** by default: `hermes workbuddy start` launches the gateway with `--no-pool`, because the gateway's own default ranks every local sign-in by remaining credit and overrides the pick on every request — the selected account looked applied while a different one was billed. Set `WORKBUDDY_POOL=1` (e.g. `WORKBUDDY_POOL=1 hermes workbuddy restart`) to get the old behaviour back: rank by credits, rotate and fail over across accounts.
+
 ## Troubleshooting: a provider shows 0 models
 
 `WorkBuddy CN — 0 models` (or Global) in the switch-model screen means Hermes probed `http://127.0.0.1:8787/v1/models` and got an empty list. Four causes, in order of likelihood:
