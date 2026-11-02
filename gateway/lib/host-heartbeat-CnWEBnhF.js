@@ -12538,7 +12538,7 @@ function describeRosterSeenPayload(raw) {
 //#endregion
 //#region src/version.ts
 /** The npm package version this build was produced from. */
-const WORKBUDDY_CONNECT_VERSION = "6.0.0";
+const WORKBUDDY_CONNECT_VERSION = "6.0.1";
 //#endregion
 //#region src/host-heartbeat.ts
 /**
