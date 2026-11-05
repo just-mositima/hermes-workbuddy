@@ -422,6 +422,39 @@ const KIND_HOST_CODE: Partial<Readonly<Record<UpstreamErrorKind, string>>> = {
 }
 
 /**
+ * The same translation for a client that reads `code` as a STRUCTURED class
+ * instead of matching English phrases in the text.
+ *
+ * `quota_exceeded` is not a neutral word. OpenAI-compatible agent runtimes map it
+ * straight onto account exhaustion: Hermes carries it in its structured billing
+ * code set (`agent/error_classifier.py`), so a `6004` — a limit with a stated
+ * reset a few hours out — is classified `billing`, marked NOT retryable, and
+ * rendered as a terminal 「额度已用尽」 card with a billing CTA. Nothing about the
+ * account changes that verdict, and the card is what a reader then chases across
+ * accounts and gateway restarts. Spelled as a rate limit the same failure backs
+ * off, names the reset, and stays inside the retry/failover set.
+ *
+ * Selected with `WORKBUDDY_HOST_ERROR_CODES=generic`; `cli.py` exports it for the
+ * gateway it starts, whose client is Hermes rather than the DSH host. Unset (or
+ * `dsh`) keeps the translation above byte for byte.
+ */
+const KIND_GENERIC_CODE: Partial<Readonly<Record<UpstreamErrorKind, string>>> = {
+  soft_rate: 'rate_limit_exceeded',
+}
+
+/**
+ * Read per call rather than at import: one gateway process can serve a DSH host
+ * and a plain OpenAI client in principle, and tests need to flip the mode without
+ * re-importing a bundle.
+ */
+function genericHostCodes(): boolean {
+  const raw = (typeof process === 'undefined' ? '' : process.env['WORKBUDDY_HOST_ERROR_CODES'] ?? '')
+    .trim()
+    .toLowerCase()
+  return raw === 'generic' || raw === 'openai' || raw === 'rate-limit'
+}
+
+/**
  * The `code` to write for an upstream failure, given its classified kind.
  *
  * `type` deliberately stays the plugin's own kind: it is what a human reads in
@@ -429,6 +462,7 @@ const KIND_HOST_CODE: Partial<Readonly<Record<UpstreamErrorKind, string>>> = {
  * Only `code` carries the host-facing translation.
  */
 function hostErrorCode(kind: UpstreamErrorKind): string {
+  if (genericHostCodes()) return KIND_GENERIC_CODE[kind] ?? kind
   return KIND_HOST_CODE[kind] ?? kind
 }
 

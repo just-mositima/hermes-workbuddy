@@ -1,5 +1,21 @@
 # Changelog
 
+## 6.0.2 (2026-11-05)
+
+### Fixes
+- **Hermes 把 6004（可重置的账号限流）当成「额度已用尽」的终态墙。**
+  `KIND_HOST_CODE` 把 `soft_rate` 翻成 `code: quota_exceeded`，这是给 DSH 宿主看的词；
+  而 Hermes 把 `quota_exceeded` 收在**结构化计费码**里（`agent/error_classifier.py`），
+  于是 429 被判成 `billing`、`retryable=False`，聊天页渲染成终态的「额度已用尽」卡片并
+  附上充值 CTA。后果是本诊断的全部症状：**换账号、重启网关、开新会话都不会消失**，
+  因为那个判定从头到尾与账号无关；用户会按卡片去查一个并不存在的计费问题。
+  现在网关按客户端方言选拼写：`WORKBUDDY_HOST_ERROR_CODES=generic`（`cli.py` 为它启动的
+  网关默认导出）把同一条失败写成 `type: soft_rate` + `code: rate_limit_exceeded`，
+  HTTP 状态仍是上游的 429，上游原文仍逐字透出；Hermes 由此归成 `rate_limit`、
+  可重试并报出重置时刻。不设该变量（或 `=dsh`）保持原有 DSH 语义，逐字节不变。
+- 新增 `tests/host-error-codes.spec.ts`：同一 `soft_rate` 两种方言的线上报文对照，
+  外加「generic 模式不改其他 kind」的清单。
+
 ## 6.0.1 (2026-11-02)
 
 ### Fixes

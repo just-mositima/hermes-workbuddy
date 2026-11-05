@@ -44,6 +44,7 @@ AUTOSTART_HOOK_NAME = "workbuddy-autostart"
 # looks applied while a different account is billed. The gateway is therefore
 # started with `--no-pool` unless WORKBUDDY_POOL turns rotation back on.
 POOL_ENV = "WORKBUDDY_POOL"
+HOST_CODES_ENV = "WORKBUDDY_HOST_ERROR_CODES"
 STOP_MARKER = "stopped"
 WATCHDOG_SECONDS = 30.0
 WORKBUDDY_PROVIDER_PREFIX = "workbuddy"
@@ -134,6 +135,13 @@ def _node_env() -> dict[str, str]:
     env = with_hermes_node_path(dict(os.environ))
     env["WORKBUDDY_STATE_DIR"] = str(_state_dir())
     env["HERMES_HOME"] = str(_hermes_home())
+    # The client on the other side of this gateway is Hermes, not the DSH host, and
+    # Hermes reads `code: quota_exceeded` as account exhaustion: a 6004 (a limit with
+    # a stated reset) becomes a NON-retryable billing verdict and a terminal
+    # 「额度已用尽」 card — which no account switch, gateway restart or new session can
+    # clear, because the failure was never about billing. `generic` spells that class
+    # as a rate limit instead; `WORKBUDDY_HOST_ERROR_CODES=dsh` restores the DSH words.
+    env.setdefault(HOST_CODES_ENV, "generic")
     return env
 
 
